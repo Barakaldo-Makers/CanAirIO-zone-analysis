@@ -1,0 +1,45 @@
+# ─── Secretos ────────────────────────────────────────────────────────
+# Nunca subir credenciales. .env.example SÍ va al repo; .env NO.
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+.gitconfig
+**/credentials*
+**/secrets*
+*.pem
+*.key
+*_token*
+!*_token*.example
+
+# ─── Datos generados ─────────────────────────────────────────────────
+site/
+data/*.json
+!data/*.example.json
+*.rdb
+influxdb_data/
+grafana_data/
+
+# ─── Copias de seguridad de despliegues ──────────────────────────────
+backup-*/
+*.bak
+*.bak-*
+
+# ─── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Sistema y editores ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

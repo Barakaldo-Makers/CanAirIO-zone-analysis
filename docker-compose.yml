@@ -1,0 +1,176 @@
+# version: "3.8"   # obsoleto en Compose v2: comentado para evitar el aviso
+
+services:
+
+  # ── Base de datos de series temporales (InfluxDB 1.12) ──────────
+  influxdb:
+    image: influxdb:1.12
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8086:8086"   # expuesto en Tailscale para mirror CanAirIO
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+    environment:
+      - INFLUXDB_DB=${INFLUXDB_DB}
+      - INFLUXDB_ADMIN_ENABLED=true
+      - INFLUXDB_ADMIN_USER=${INFLUXDB_ADMIN_USER}
+      - INFLUXDB_ADMIN_PASSWORD=${INFLUXDB_ADMIN_PASSWORD}
+      - INFLUXDB_USER=${INFLUXDB_USER}
+      - INFLUXDB_USER_PASSWORD=${INFLUXDB_USER_PASSWORD}
+      - INFLUXDB_HTTP_AUTH_ENABLED=true
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ── Visualización ────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    mem_limit: 256m
+
+
+
+  # ── AI Bridge (análisis automático) ──────────────────────────────
+  ai-bridge:
+    build: ./ai-bridge
+    container_name: ai-bridge
+    # Escribe en SITE_DIR con tu UID:GID, no como root: si no, los ficheros
+    # del repo git quedan en propiedad de root y el push falla desde tu shell.
+    # Averigua los tuyos con:  id -u; id -g
+    user: "${AI_BRIDGE_UID:-1000}:${AI_BRIDGE_GID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      # Repo git (o carpeta) donde se escriben los JSON publicados.
+      # Define SITE_DIR en .env con la ruta absoluta de tu clon.
+      - ${SITE_DIR:-./site}:/site
+    environment:
+      # ── InfluxDB ──────────────────────────────────────────────────
+      - INFLUXDB_HOST=influxdb
+      - INFLUXDB_PORT=8086
+      - INFLUXDB_DB=${INFLUXDB_DB}
+      - INFLUXDB_USER=${INFLUXDB_ADMIN_USER}
+      - INFLUXDB_PASSWORD=${INFLUXDB_ADMIN_PASSWORD}
+      - ANALYSIS_DB=analysis
+
+      # ── Motor de informes: reglas deterministas, sin LLM ──────────
+      - ANALYSIS_MODE=rules
+
+      # ── Ciclo de análisis ─────────────────────────────────────────
+      - ANALYSIS_INTERVAL=${ANALYSIS_INTERVAL}
+      - DEFAULT_HOURS=48
+
+      # ── Análisis global por tiers (sin límite de zonas) ───────────
+      # Tier 1: dato < 2h  → análisis completo cada ciclo
+      # Tier 2: dato < 24h → análisis completo cada 2 ciclos
+      # Tier 3: dato < 7d  → solo estadística cada 6 ciclos
+      # Tier 4: histórica  → una vez al día (daily_summary)
+      - TIER1_HOURS=2
+      - TIER2_HOURS=24
+      - TIER3_HOURS=168
+      - TIER3_NO_WEATHER=1
+
+      # ── Alertas: persistencia e histéresis ────────────────────────
+      - ALERT_PERSIST_H=1
+      - ALERT_HYSTERESIS=0.10
+
+      # ── Detección de congelados (db, tmp, hum) ────────────────────
+      - FREEZE_DETECT_METRICS=db,tmp,hum
+
+      # ── Episodios sostenidos ──────────────────────────────────────
+      - EPISODE_MIN_HOURS=2
+
+      # ── Corrección PM ─────────────────────────────────────────────
+      - PM_CORRECTION_ENABLED=1
+      - PM_CORRECTION_MIN_RHO=0.5
+
+      # ── Validación CAMS/Copernicus ────────────────────────────────
+      - SATCOMP_ENABLED=1
+      - SATCOMP_CACHE_TTL=3600
+
+      # ── Referencia oficial: zonas donde se intenta ────────────────
+      # Vacío = AUTOMÁTICO en todas las zonas; cada fuente decide si cubre
+      # la posición real de los sensores. Rellenar solo para limitar el gasto
+      # de red a unas zonas concretas (ej. ZONE_HAS_OFFICIAL=u33,d2g).
+      - ZONE_HAS_OFFICIAL=
+
+      # ── Red oficial local: Gobierno Vasco (Open Data Euskadi) ─────
+      # Las estaciones se descubren solas desde estaciones.csv + url.txt y se
+      # eligen por cercanía Y por cobertura de métricas: sigue descargando
+      # hasta cubrir EUSKADI_TARGET_METRICS, porque la estación que mide NH3
+      # u O3 (unidades móviles de Zorroza/Elorrieta) no es la más cercana.
+      - EUSKADI_ENABLED=1
+      - EUSKADI_YEAR=2026
+      - EUSKADI_RADIUS_KM=25
+      - EUSKADI_MAX_STATIONS=12      # candidatas del índice
+      - EUSKADI_MAX_FETCH=8          # tope de CSV descargados por zona
+      - EUSKADI_MIN_STATIONS=3       # mínimo a promediar
+      - EUSKADI_TARGET_METRICS=pm25,pm10,no2,o3,nh3,co,so2
+      - EUSKADI_HOUR_OFFSET=-1       # la etiqueta "H" cubre [H-1,H)
+      - EUSKADI_INDEX_TTL=86400
+      # EUSKADI_STATIONS solo para forzar estaciones concretas a mano,
+      # con el nombre tal cual lo publica estaciones.csv:
+      # - EUSKADI_STATIONS=BARAKALDO,UNIDAD_MOVIL_10
+
+      # ── Referencia oficial global: OpenAQ v3 ──────────────────────
+      # Da estaciones oficiales reales a las zonas de fuera de Euskadi
+      # (Berlín, Calgary, Cali, Bogotá...), que antes solo tenían CAMS.
+      - OPENAQ_ENABLED=1
+      - OPENAQ_API_KEY=${OPENAQ_API_KEY}
+      - OPENAQ_RADIUS_KM=25          # máximo que admite la API
+      - OPENAQ_MONITOR_ONLY=1        # solo monitores de referencia
+      - OPENAQ_EXCLUDE_MOBILE=1
+      - OPENAQ_MAX_LOCATIONS=8
+      - OPENAQ_MAX_SENSORS=24
+      - OPENAQ_MIN_COVERAGE=50       # % de cobertura horaria mínima
+      - OPENAQ_MIN_INTERVAL=0.25     # s entre peticiones (límite de la API)
+      - OPENAQ_LOC_TTL=86400
+
+      # ── Validación cruzada entre sensores ────────────────────────
+      - CROSS_MIN_SENSORS=3
+      - CROSS_MIN_N=12
+
+      # ── Rosa de contaminación ─────────────────────────────────────
+      - ROSE_CALM_KMH=5
+
+      # ── Publicación GitHub Pages ──────────────────────────────────
+      - PUBLISH_ENABLED=1
+      - PUBLISH_DIR=/site
+      - PUBLISH_HOURS=48
+      - PUBLISH_HISTORY_DAYS=30
+      - GIT_AUTHOR=ai-bridge <bot@localhost>
+      - GIT_CONFIG_GLOBAL=/site/.gitconfig
+
+      # ── Telegram (opcional; deja las variables vacías para no usarlo) ──
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - DAILY_SUMMARY_HOUR=8
+      # URL pública de tu web, para enlazarla en los avisos (opcional)
+      - WEB_URL=${WEB_URL:-}
+
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    mem_limit: 512m
+
+
+volumes:
+  influxdb_data:
+  grafana_data:
