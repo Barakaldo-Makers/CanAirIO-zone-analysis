@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# canairio-zone-analysis — official reference: worldwide reference-grade stations (OpenAQ v3)
+# CanAirIO-zone-analysis — official reference: worldwide reference-grade stations (OpenAQ v3)
 # Copyright (C) 2026 Barakaldo Makers
 #
 # This program is free software: you can redistribute it and/or modify

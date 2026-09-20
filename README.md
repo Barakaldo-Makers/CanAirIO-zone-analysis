@@ -1,4 +1,4 @@
-# canairio-zone-analysis
+# CanAirIO-zone-analysis
 
 **Rigorous statistical analysis of [CanAirIO](https://canair.io) air-quality
 data, validated against official reference stations.**
@@ -96,8 +96,8 @@ Requires Docker, and an InfluxDB 1.x holding CanAirIO data (measurement
 `fixed_stations_01`, tags `geo3` and `mac`).
 
 ```bash
-git clone https://github.com/Barakaldo-Makers/canairio-zone-analysis.git
-cd canairio-zone-analysis
+git clone https://github.com/Barakaldo-Makers/CanAirIO-zone-analysis.git
+cd CanAirIO-zone-analysis
 
 cp .env.example .env
 $EDITOR .env          # passwords, SITE_DIR, and your UID/GID

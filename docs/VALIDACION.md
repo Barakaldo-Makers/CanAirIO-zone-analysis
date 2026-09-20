@@ -1,6 +1,6 @@
 # Por qué hace falta validar: seis fallos que solo aparecen al contrastar
 
-**canairio-zone-analysis** · caso real, septiembre de 2026
+**CanAirIO-zone-analysis** · caso real, septiembre de 2026
 
 > Este documento es el argumento del proyecto. Todos los fallos que describe
 > estuvieron activos durante semanas en una red real sin que nada los

@@ -1,6 +1,6 @@
 # Referencias oficiales: red vasca automática + OpenAQ global
 
-**canairio-zone-analysis** · septiembre de 2026
+**CanAirIO-zone-analysis** · septiembre de 2026
 
 Antes el sistema validaba los sensores contra tres cosas, y solo una de ellas
 eran estaciones reales:

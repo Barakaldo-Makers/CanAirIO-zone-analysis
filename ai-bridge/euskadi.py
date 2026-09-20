@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# canairio-zone-analysis — official reference: Basque Government air-quality network
+# CanAirIO-zone-analysis — official reference: Basque Government air-quality network
 # Copyright (C) 2026 Barakaldo Makers
 #
 # This program is free software: you can redistribute it and/or modify

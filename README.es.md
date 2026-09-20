@@ -1,4 +1,4 @@
-# canairio-zone-analysis
+# CanAirIO-zone-analysis
 
 **Análisis estadístico riguroso de datos de [CanAirIO](https://canair.io),
 validado contra estaciones oficiales de referencia.**
@@ -98,8 +98,8 @@ Necesitas Docker y un InfluxDB 1.x con datos de CanAirIO (measurement
 `fixed_stations_01`, tags `geo3` y `mac`).
 
 ```bash
-git clone https://github.com/Barakaldo-Makers/canairio-zone-analysis.git
-cd canairio-zone-analysis
+git clone https://github.com/Barakaldo-Makers/CanAirIO-zone-analysis.git
+cd CanAirIO-zone-analysis
 
 cp .env.example .env
 $EDITOR .env          # contraseñas, SITE_DIR y tu UID/GID

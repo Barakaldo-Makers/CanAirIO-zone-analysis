@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# canairio-zone-analysis — read-only health check
+# CanAirIO-zone-analysis — read-only health check
 # Copyright (C) 2026 Barakaldo Makers
 # =====================================================================
 #  check.sh — verificacion del ai-bridge (solo lectura)

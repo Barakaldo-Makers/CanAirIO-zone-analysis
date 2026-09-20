@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# canairio-zone-analysis — pre-publication audit
+# CanAirIO-zone-analysis — pre-publication audit
 # Copyright (C) 2026 Barakaldo Makers
 #
 # =====================================================================

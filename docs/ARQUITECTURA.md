@@ -1,6 +1,6 @@
 # Arquitectura del motor de análisis
 
-**canairio-zone-analysis** · septiembre de 2026
+**CanAirIO-zone-analysis** · septiembre de 2026
 
 > Documento en español. El README está en
 > [inglés](../README.md) y [español](../README.es.md).
