@@ -1,4 +1,4 @@
-# Por qué hace falta validar: siete fallos que solo aparecen al contrastar
+# Por qué hace falta validar: ocho fallos que solo aparecen al contrastar
 
 **CanAirIO-zone-analysis** · caso real, septiembre de 2026
 
@@ -7,7 +7,7 @@
 > señalara, y solo salieron a la luz al comparar contra cabinas oficiales.
 > Las cifras son medidas, no estimaciones.
 
-Lo que empezó como «no veo el NH3 en la web» destapó siete fallos de fondo, tres
+Lo que empezó como «no veo el NH3 en la web» destapó ocho fallos de fondo, cuatro
 de ellos silenciosos desde hacía semanas. El séptimo no lo encontró una queja
 sino una lectura: una tesis doctoral sobre calidad de datos en redes IoT
 describía exactamente el fallo que teníamos. Este documento recoge qué pasaba, cómo
@@ -28,6 +28,8 @@ se detectó y qué se cambió, por orden de descubrimiento.
 | Episodios detectados | 2, de humedad | **0** |
 | Métricas que desaparecían sin avisar | sí | no |
 | Episodios de PM detectables en una zona tranquila | **ninguno** | todos |
+| Persistencia e histéresis de avisos | código muerto | activas |
+| Historial de factores | mezclaba CAMS y cabina | separado por base |
 
 Las cifras de arriba son medidas reales de la zona `ezt`, no estimaciones.
 
@@ -353,6 +355,140 @@ fecha en que `fH` entra en juego se ve en `history_hours_ready` de
 
 ---
 
+
+## 8. Avisos sin persistencia ni histéresis, y un historial que mezclaba referencias
+
+Dos fallos del mismo tipo que el de `statistics` contra `metrics`: el código
+existe, parece correcto y no hace lo que dice.
+
+### 8a. `detect_alerts` se llamaba con la mitad de los argumentos
+
+```python
+result["alerts"] = detect_alerts(stats_by_metric, confidence)
+```
+
+La función acepta además `prev_alerts` y `series_recent`, y son justo los que
+activan las dos mejoras documentadas como P1.3:
+
+- **Persistencia**: la comprobación es `if series_recent and m in series_recent
+  and PERSIST_H > 1`. Con `series_recent=None` nunca entraba. Y `ALERT_PERSIST_H`
+  venía a `1`, que la desactiva por sí solo, así que había dos capas de nada.
+- **Histéresis**: `prev_set` se construye de `prev_alerts or []`, luego salía
+  vacío y `was_active` era siempre `None`. Peor: **`prev_alerts` no tenía fuente
+  en ninguna parte del proyecto**. No era que se olvidara pasarlo; es que nadie
+  guardaba las alertas del ciclo anterior.
+
+Resultado: un pico de una sola hora disparaba aviso, y un valor oscilando en el
+umbral lo encendía y apagaba en ciclos alternos.
+
+Arreglado: hay un almacén `_last_alerts` por zona y sensor, se pasan los dos
+argumentos y `ALERT_PERSIST_H` pasa a 2.
+
+| | antes | ahora |
+|---|---|---|
+| Pico de **1 hora** a 30 µg/m³ | `warning` | **ninguna** |
+| 2 horas seguidas a 30 | `warning` | `warning` |
+| Aviso activo, el valor baja a 24 | ninguna (parpadeo) | **`warning`** |
+| Aviso activo, el valor baja a 22,4 | ninguna | ninguna |
+
+El límite de histéresis es 25 × 0,9 = 22,5, tal como decía el docstring.
+
+> Si despliegas esto, comprueba que `ALERT_PERSIST_H` no esté fijado a `1` en tu
+> `.env` o tu `docker-compose.yml`: el entorno pisa el valor por defecto del
+> código, y con `1` la persistencia sigue apagada. Pasó en el despliegue original.
+
+### 8b. `pm_factor_history` mezclaba dos referencias distintas
+
+`_save_pm_factor_history()` se llama **dos veces por ciclo**: una con el factor
+derivado de CAMS y otra con el derivado de la cabina oficial. Las dos escribían
+con los mismos tags (`{"geo3": geo3}`) y sin timestamp explícito, así que
+quedaban como dos puntos distintos y ambos se conservaban.
+
+El detector de deriva hacía la mediana diaria **sobre la mezcla**. Para PM2.5 de
+la zona de referencia eso es la mediana de una distribución con dos modas:
+
+| | factor |
+|---|---|
+| Derivado de CAMS | ×0,664 |
+| Derivado de la cabina oficial | ×1,233 |
+| **Lo que reportaba el detector** | **×0,732** |
+
+Ni el valor ni su variabilidad significan nada. Y como la mezcla es muy
+dispersa, la banda salía tan ancha que se tragaba cualquier cambio: el informe
+daba «−17,2 %» y «estable» en la misma línea.
+
+Arreglado: el measurement gana el tag `basis` y el detector juzga **una sola
+base** — la oficial si existe, CAMS como respaldo advirtiendo de que entonces
+mide deriva frente a un modelo y no frente a una medida, y nunca la mezcla. Los
+puntos anteriores al tag no se pueden atribuir, así que quedan fuera del
+veredicto y el detector lo dice con esas palabras en vez de dar una cifra.
+
+Y un cambio grande que cae dentro de la banda ya no se llama «estable»: pasa a
+`sin_concluir` con la banda a la vista y la explicación de que es ruido.
+
+### El detector, y por qué α-de-W
+
+Viene del capítulo 4 de la tesis, que declara deriva cuando **α** muestras de una
+ventana **W** salen de banda, en vez de reaccionar a una sola. Su mecanismo de
+recalibración exige re-coubicar el sensor junto a una cabina; aquí no hace falta,
+porque la referencia llega por API y el factor se recalcula en cada ciclo. Lo que
+faltaba era la señal: `pm_factor_history` se escribía y **no lo leía nadie**.
+
+Se agrega por día, no por ciclo: el envejecimiento de un sensor pasa en semanas,
+y con ciclos de 30 minutos una ventana de 6 muestras serían 3 horas. La banda se
+calcula sobre el historial anterior a la ventana reciente, con suelo relativo del
+10 %: si el factor lleva doce días clavado el MAD es 0, y sin suelo cualquier
+variación sería «deriva».
+
+`factor = referencia / sensor`. Si **sube**, el sensor lee cada vez más bajo
+frente a la cabina: óptica sucia o sensor envejecido. Si **baja**, conviene mirar
+si cambió la estación de referencia antes de culpar al sensor.
+
+| historial simulado | veredicto |
+|---|---|
+| 8 días | `sin_historial_suficiente` (8/12) |
+| 30 días estables | `estable`, 0/6 fuera |
+| 30 días clavados en la misma cifra | `estable` (el suelo de banda hace su trabajo) |
+| **1 día anómalo suelto** | **`estable`**, 1/6 fuera |
+| ×1,233 → ×1,660 progresivo | `deriva`, 5/6, +34,2 % |
+| Ruidoso, −17,5 %, banda [0,731, 1,767] | `sin_concluir`: es ruido |
+
+El cuarto caso es lo que compra la regla: un día anómalo no es deriva.
+
+### El retardo δ: no implementado, a propósito
+
+El δ de dESOD-WH (capítulo 6) existe porque ESOD es un algoritmo de streaming en
+el borde: decide una vez, de forma irrevocable, conforme llega cada muestra. Este
+proyecto recalcula la ventana entera de 168 h en cada ciclo, así que un punto que
+hoy está en el borde mañana está en mitad de ella y se juzga con contexto por los
+dos lados. **El δ ya existe, y se llama recálculo.**
+
+Donde sí faltaba contexto era en los avisos, que se deciden sobre `last_value`.
+Eso es el apartado 8a.
+
+### Historial de cabina: el requisito de TPB-D
+
+TPB-D (capítulo 3) construye un subespacio con los perfiles **diarios** de
+cabinas cercanas y proyecta sobre él el día del sensor. El §3.2.4 demuestra que
+**no necesita instrumento co-ubicado**, lo que encaja con este proyecto (O3 MOX:
+RMSE 15,24 → 13,1; R² 0,57 → 0,68).
+
+Lo que sí necesita es historial. El umbral de κ de Gavish-Donoho usa β = D/M con
+D = 24 h, y β debe ser ≤ 1: hacen falta **M ≥ 24 días completos**, y de 40 a 60
+para ir cómodo. El proyecto pedía 168 h de cabina en cada ciclo y las tiraba.
+
+Ahora se guardan en el measurement `ref_history` (tags `geo3`/`provider`/
+`metric`), y `/ref-history` calcula los días completos y la β. Un día cuenta si
+trae al menos 20 de sus 24 horas, porque TPB-D trabaja con vectores diarios de
+dimensión 24.
+
+**TPB-D no está implementado**, y es una decisión, no un olvido: hasta que haya
+24 días completos no hay nada que valorar, y cuando los haya será solo para
+**O3**. La tesis dice sin rodeos que PM2.5 y NO son demasiado irregulares para
+este método, y PM2.5 es precisamente la métrica fiable de este despliegue.
+
+---
+
 ---
 
 ## Cambios en la web (`index.html`)
@@ -403,6 +539,22 @@ ESOD_HIST_DAYS=90      # ventana del repositorio histórico
 ESOD_HIST_MIN_N=14     # muestras mínimas de una hora para fiarse de ella
 ESOD_HIST_K=1.5        # margen sobre el p95 histórico
 ESOD_HIST_WRITE_H=48   # horas que se regraban en cada ciclo
+
+# Deriva del factor (regla alpha-de-W)
+DRIFT_ENABLE=1
+DRIFT_W=6              # días recientes de la ventana
+DRIFT_ALPHA=4          # cuántos deben salir de banda
+DRIFT_MIN_DAYS=12      # historial mínimo para opinar
+DRIFT_K=3.0            # anchura de la banda, en sigmas
+DRIFT_BAND_MIN_PCT=10  # suelo relativo de la banda
+DRIFT_HIST_DAYS=120
+
+# Historial de cabina (requisito previo de TPB-D)
+REF_HIST_ENABLE=1
+REF_HIST_DAYS=180
+
+# Avisos
+ALERT_PERSIST_H=2      # antes 1, que desactivaba la persistencia
 ```
 
 ---
@@ -414,11 +566,14 @@ ESOD_HIST_WRITE_H=48   # horas que se regraban en cada ciclo
 /euskadi-debug[/<geo3>]          índice de la red vasca, selección y cobertura
 /openaq-debug[/<geo3>]           estaciones OpenAQ del radio y métricas
 /esod-debug/<geo3>               antes/después del filtrado, estado del histórico
+/drift[/<geo3>]                  deriva del factor, con la base que la sustenta
+/ref-history[/<geo3>]            días de cabina acumulados y si dan para TPB-D
 ```
 
 `/analysis/<geo3>` añade: `aggregation`, `discarded_metrics`,
 `official_provider`, `official_meta`, `applied_*` dentro de `pm_corrections`, y
-`rescued_history` / `rescued_run` / `rescue_note` dentro de `cleaning`.
+`rescued_history` / `rescued_run` / `rescue_note` dentro de `cleaning`, y
+`factor_drift` con la base de la que sale cada factor.
 
 > **Ojo al leer la API:** las estadísticas por métrica se publican como
 > **`statistics`**, no `metrics` (`result["statistics"] = zs["metrics"]`).

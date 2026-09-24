@@ -3,6 +3,38 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 Versionado semántico.
 
+## [1.2.0] — 2026-09-24
+
+### Añadido
+- **Detector de deriva del factor de corrección** (regla α-de-W, de Allka 2025,
+  cap. 4): hay deriva cuando al menos `DRIFT_ALPHA` de los `DRIFT_W` días
+  recientes salen de la banda del historial anterior. Se agrega por día, no por
+  ciclo, y la banda lleva suelo relativo para que un factor muy estable no dé
+  falsos positivos. Endpoint `/drift[/<geo3>]` y bloque `factor_drift`.
+- **Repositorio de referencia oficial** (`ref_history`): guarda la serie horaria
+  de cabina que antes se descartaba. Es el requisito previo de TPB-D, que
+  necesita M ≥ 24 días completos porque β = 24/M debe ser ≤ 1. Endpoint
+  `/ref-history[/<geo3>]` con los días acumulados y la β de Gavish-Donoho.
+
+### Corregido
+- **La persistencia y la histéresis de avisos eran código muerto.**
+  `detect_alerts()` se llamaba sin `series_recent` ni `prev_alerts`, así que la
+  comprobación de persistencia nunca entraba y la histéresis partía siempre de
+  vacío; `prev_alerts` además no tenía fuente en ninguna parte del proyecto.
+  Ahora hay un almacén `_last_alerts` por zona/sensor y `ALERT_PERSIST_H` pasa
+  a 2. Un pico de una sola hora ya no dispara aviso.
+- **`pm_factor_history` mezclaba dos referencias.** Se escribe dos veces por
+  ciclo, una con el factor derivado de CAMS y otra con el de la cabina, y sin
+  tag que las distinguiera la mediana diaria combinaba ×0,664 con ×1,233 y
+  reportaba ×0,732. El measurement gana el tag `basis` y el detector juzga una
+  sola base: la oficial si existe, CAMS como respaldo advirtiéndolo, nunca la
+  mezcla.
+- Un cambio grande dentro de la banda ya no se etiqueta «estable»: pasa a
+  `sin_concluir`, con la banda a la vista.
+- `ref_history_state()` recorría dos veces el generador de puntos que devuelve
+  `ResultSet.items()` de influxdb-python, y el segundo cómputo salía a 0
+  («1 día, 0 horas»).
+
 ## [1.1.0] — 2026-09-24
 
 ### Añadido

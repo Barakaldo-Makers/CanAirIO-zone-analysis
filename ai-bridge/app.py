@@ -1,3 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# CanAirIO-zone-analysis — statistical analysis engine for CanAirIO air-quality zones
+# Copyright (C) 2026 Barakaldo Makers
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """
 ai-bridge v2 — Análisis riguroso de calidad del aire CanAirIO por zona (geo3)
 ==============================================================================
@@ -33,6 +51,7 @@ from influxdb import InfluxDBClient
 from apscheduler.schedulers.background import BackgroundScheduler
 import publisher
 import euskadi
+import openaq
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO,
@@ -90,6 +109,65 @@ TIER3_HOURS = int(os.getenv("TIER3_HOURS", "168"))   # dormida: solo estadístic
 TIER3_NO_WEATHER = os.getenv("TIER3_NO_WEATHER", "1") == "1"
 MAX_GAP_HOURS     = float(os.getenv("MAX_GAP_HOURS", "2"))
 MAD_FACTOR        = float(os.getenv("MAD_FACTOR", "5.0"))
+
+# ── ESOD-WH: ventana deslizante + repositorio histórico ──────────────────────
+# Allka, X. (UPC, 2025), "Enhancing Data Quality in IoT Monitoring Sensor
+# Networks", cap. 6. El filtrado con SOLO la ventana actual (ESOD-W) marca como
+# atípico un punto que es extremo en esa ventana aunque sea perfectamente normal
+# en la distribución histórica. Consecuencia medida aquí: con la mediana real de
+# la zona ezt (5,4 µg/m³) el MAD pone el techo en ~13,5 µg/m³, por debajo del
+# umbral de episodio de PM2.5 (25) y muy por debajo del crítico (75). Es decir,
+# clean_series borraba TODOS los episodios de PM antes de que detect_episodes()
+# y detect_alerts() los vieran. Nunca pudieron dispararse.
+#
+# ESOD-WH añade un segundo repositorio (el histórico) y solo descarta el punto
+# si es atípico en AMBOS. Aquí se implementan dos rescates:
+#   fH  - el valor cabe en la distribución histórica de su hora del día.
+#   run - el valor forma parte de una excursión sostenida (>= ESOD_RUN_H horas
+#         seguidas). Un fallo puntual de lectura no dura horas; un episodio sí.
+# El rescate por racha funciona desde el primer ciclo; el histórico necesita
+# acumular datos, así que al principio trabaja solo el primero.
+ESOD_ENABLE       = os.getenv("ESOD_ENABLE", "1") not in ("0", "false", "no")
+ESOD_RUN_H        = int(os.getenv("ESOD_RUN_H", "2"))        # horas seguidas
+ESOD_STUCK_H      = int(os.getenv("ESOD_STUCK_H", "6"))      # clavado = avería
+ESOD_HIST_DAYS    = int(os.getenv("ESOD_HIST_DAYS", "90"))   # ventana histórica
+ESOD_HIST_MIN_N   = int(os.getenv("ESOD_HIST_MIN_N", "14"))  # muestras/hora mín.
+ESOD_HIST_K       = float(os.getenv("ESOD_HIST_K", "1.5"))   # margen sobre p99
+ESOD_HIST_WRITE_H = int(os.getenv("ESOD_HIST_WRITE_H", "48"))  # horas a grabar
+
+# ── W-UDDR: detección de deriva sobre el historial de factores ───────────────
+# Allka, X. (UPC, 2025), cap. 4. La tesis declara deriva cuando α muestras de
+# una ventana W superan un umbral, en vez de reaccionar a una sola muestra. Su
+# recalibración exige re-coubicar el sensor junto a una cabina; aquí eso no hace
+# falta, porque la referencia oficial llega por API y el factor se recalcula en
+# cada ciclo. Lo que faltaba era la señal de "esto ha cambiado": escribíamos
+# pm_factor_history en dos sitios y NO LO LEÍA NADIE. Teníamos el registro de la
+# deriva y ningún detector.
+#
+# Se agrega por día (no por ciclo) porque el envejecimiento de un sensor pasa en
+# semanas: con ciclos de 30 min, una ventana de 6 muestras serían 3 horas y no
+# diría nada. La banda se calcula sobre el historial ANTERIOR a la ventana
+# reciente, con un suelo relativo: si el factor lleva doce días clavado, el MAD
+# es 0 y sin suelo cualquier variación sería "deriva".
+DRIFT_ENABLE       = os.getenv("DRIFT_ENABLE", "1") not in ("0", "false", "no")
+DRIFT_W            = int(os.getenv("DRIFT_W", "6"))          # días recientes
+DRIFT_ALPHA        = int(os.getenv("DRIFT_ALPHA", "4"))      # cuántos fuera (α)
+DRIFT_MIN_DAYS     = int(os.getenv("DRIFT_MIN_DAYS", "12"))  # historial mínimo
+DRIFT_K            = float(os.getenv("DRIFT_K", "3.0"))      # anchura en sigmas
+DRIFT_BAND_MIN_PCT = float(os.getenv("DRIFT_BAND_MIN_PCT", "10"))
+DRIFT_HIST_DAYS    = int(os.getenv("DRIFT_HIST_DAYS", "120"))
+
+# ── Repositorio de referencia oficial (requisito previo de TPB-D) ────────────
+# Allka, X. (UPC, 2025), cap. 3: TPB-D construye un subespacio con los perfiles
+# DIARIOS de cabinas y proyecta sobre él el día del sensor. El §3.2.4 demuestra
+# que NO necesita instrumento co-ubicado —basta con estaciones cercanas—, que es
+# exactamente nuestro caso (O3 MOX: RMSE 15,24 -> 13,1; R² 0,57 -> 0,68).
+# Lo que sí necesita es historial: el umbral de κ de Gavish-Donoho usa β = D/M
+# con D = 24 h, así que hacen falta M >= 24 días y en la práctica 40-60. Pedimos
+# 168 h de cabina en cada ciclo y las tirábamos. Esto las guarda. TPB-D no se
+# implementa aquí: se podrá valorar cuando /ref-history diga que hay historial.
+REF_HIST_ENABLE = os.getenv("REF_HIST_ENABLE", "1") not in ("0", "false", "no")
+REF_HIST_DAYS   = int(os.getenv("REF_HIST_DAYS", "180"))
 
 # P1.1: Historical Forecast API (inicializada con observaciones reales, más
 # precisa que el pronóstico simple). Cobertura global, sin API key.
@@ -264,11 +342,30 @@ def zone_sensors(geo3, hours=None):
         c.close()
 
 
-def fetch_zone_series(geo3, hours, mac=None):
+# Combinación entre sensores dentro de una zona: "median" o "mean".
+# La mediana aguanta que un sensor esté descalibrado; la media no.
+ZONE_AGG = os.getenv("ZONE_AGG", "median")
+# Un nodo sin sensor para una métrica publica 0 en todas sus lecturas (el
+# firmware de CanAirIO rellena el campo en vez de omitirlo). Si TODAS las
+# lecturas de un sensor en la ventana son exactamente 0, ese sensor no mide esa
+# métrica y hay que EXCLUIRLO, no promediarlo: los nodos de ruido y de gases
+# hundían el PM de la zona (0,33 µg/m³ con 93% de los puntos a cero).
+ZERO_MEANS_ABSENT = os.getenv("ZERO_MEANS_ABSENT", "1") == "1"
+
+
+def fetch_zone_series(geo3, hours, mac=None, info=None):
     """
-    Serie horaria agregada: media de cada métrica por hora.
-    Si se da `mac`, filtra por ese sensor concreto (análisis individual);
-    si no, agrega toda la zona geo3. La agregación la hace InfluxDB.
+    Serie horaria de cada métrica para la zona.
+
+    Con `mac` analiza ese sensor solo. Sin `mac` agrega la zona, y lo hace en
+    DOS pasos: primero la media horaria de CADA sensor, después la mediana
+    entre sensores. Antes se hacía un único mean() sobre todos los puntos, lo
+    que ponderaba por frecuencia de publicación: un nodo que publica cada 30 s
+    pesaba diez veces más que uno de cada 5 min.
+
+    `info`, si se pasa, se rellena con el detalle de la agregación
+    (sensores usados y excluidos por métrica).
+
     Devuelve dict: { metric: (times_epoch_s ndarray, values ndarray) }
     """
     sel = ", ".join(f'mean("{m}") AS "{m}"' for m in METRICS)
@@ -281,33 +378,455 @@ def fetch_zone_series(geo3, hours, mac=None):
         where = f"\"mac\" = '{mac}' AND " + where
     q = (f'SELECT {sel} FROM "{MEASUREMENT}" '
          f"WHERE {where} "
-         f'GROUP BY time(1h) fill(none)')
+         f'GROUP BY "mac", time(1h) fill(none)')
     c = influx_client()
     try:
         res = c.query(q, epoch="s")
-        series = {m: ([], []) for m in METRICS}
-        for p in res.get_points():
-            t = p["time"]
-            for m in METRICS:
-                v = p.get(m)
-                if v is None:
-                    continue
-                # hora congelada (mismo valor exacto toda la hora): descartar.
-                # stddev es None con un solo punto (sin evidencia: se mantiene).
-                if m in FREEZE_DETECT_METRICS and p.get(f"{m}__sd") == 0:
-                    continue
-                series[m][0].append(t)
-                series[m][1].append(float(v))
-        return {m: (np.asarray(ts, dtype=np.float64),
-                    np.asarray(vs, dtype=np.float64))
-                for m, (ts, vs) in series.items() if len(vs) >= 3}
+        # por_mac[mac][metric] = {hora: valor}
+        por_mac = {}
+        for (_meas, tags), pts in res.items():
+            mk = (tags or {}).get("mac") or mac or "?"
+            dest = por_mac.setdefault(mk, {})
+            for p in pts:
+                t = p["time"]
+                for m in METRICS:
+                    v = p.get(m)
+                    if v is None:
+                        continue
+                    # hora congelada (mismo valor exacto toda la hora).
+                    # stddev es None con un solo punto: sin evidencia, se mantiene.
+                    if m in FREEZE_DETECT_METRICS and p.get(f"{m}__sd") == 0:
+                        continue
+                    dest.setdefault(m, {})[t] = float(v)
     finally:
         c.close()
 
-# ── Limpieza ─────────────────────────────────────────────────────────────────
-def clean_series(t, v, metric):
+    usados, excluidos = {}, {}
+    # 1) descarta la métrica en los sensores que no la miden (todo a cero)
+    for mk, metrics in por_mac.items():
+        for m in list(metrics):
+            vals = metrics[m]
+            if ZERO_MEANS_ABSENT and vals and all(v == 0.0 for v in vals.values()):
+                excluidos.setdefault(m, []).append(mk)
+                del metrics[m]
+            elif vals:
+                usados.setdefault(m, []).append(mk)
+
+    # 2) combina entre sensores, hora a hora
+    series = {}
+    for m in METRICS:
+        por_hora = {}
+        for metrics in por_mac.values():
+            for t, v in (metrics.get(m) or {}).items():
+                por_hora.setdefault(t, []).append(v)
+        if len(por_hora) < 3:
+            continue
+        ts = sorted(por_hora)
+        if ZONE_AGG == "mean":
+            vs = [float(np.mean(por_hora[t])) for t in ts]
+        else:
+            vs = [float(np.median(por_hora[t])) for t in ts]
+        series[m] = (np.asarray(ts, dtype=np.float64),
+                     np.asarray(vs, dtype=np.float64))
+
+    if info is not None:
+        info["agg"] = ZONE_AGG
+        info["sensors_seen"] = len(por_mac)
+        info["sensors_used"] = {m: sorted(v) for m, v in usados.items()}
+        info["sensors_excluded_all_zero"] = {m: sorted(v)
+                                             for m, v in excluidos.items()}
+    if excluidos:
+        log.info("zona %s: excluidos por leer siempre 0 -> %s", geo3,
+                 "; ".join(f"{m}: {len(v)}" for m, v in excluidos.items()))
+    return series
+
+# ── ESOD-WH: repositorio histórico (fH) ──────────────────────────────────────
+_ESOD_HIST_CACHE = {}   # (geo3, mac) -> (epoch_carga, hist)
+_ESOD_DB_LISTA = [False]
+
+def _esod_hist_key(mac):
+    return mac or "_zone"
+
+def _esod_db():
+    """Cliente sobre ANALYSIS_DB, creándola la primera vez si no existe."""
+    if not _ESOD_DB_LISTA[0]:
+        analysis_db_client().close()      # crea la BD si falta
+        _ESOD_DB_LISTA[0] = True
+    c = influx_client()
+    c.switch_database(ANALYSIS_DB)
+    return c
+
+def _esod_hist_save(geo3, mac, metric, t, v):
     """
-    1) Rango físico válido. 2) Outliers por MAD robusto (descarta |z|>MAD_FACTOR).
+    Graba en la BD de análisis los valores horarios que han pasado el rango
+    físico (ANTES del MAD: el histórico debe contener los episodios reales, no
+    solo lo que el filtro dejó pasar). Se escribe con el timestamp de la hora,
+    así que reescribir la misma hora en ciclos sucesivos es idempotente:
+    InfluxDB sobreescribe si coinciden measurement + tags + tiempo.
+    """
+    if not ESOD_ENABLE or len(v) == 0:
+        return
+    corte = time.time() - ESOD_HIST_WRITE_H * 3600.0
+    puntos = []
+    for ti, vi in zip(t, v):
+        if ti < corte:
+            continue
+        hod = int((ti % 86400) // 3600)
+        puntos.append({
+            "measurement": "esod_history",
+            "tags": {"geo3": geo3, "mac": _esod_hist_key(mac),
+                     "metric": metric, "hod": str(hod)},
+            "time": int(ti) * 1000000000,
+            "fields": {"v": float(vi)},
+        })
+    if not puntos:
+        return
+    try:
+        c = _esod_db()
+        c.write_points(puntos)
+        c.close()
+    except Exception as e:
+        log.debug("esod: no pude grabar histórico %s/%s: %s", geo3, metric, e)
+
+def _esod_hist_load(geo3, mac):
+    """
+    Devuelve {metric: {hod: {"p95": float, "n": int}}} de los últimos
+    ESOD_HIST_DAYS días. Dos consultas de una sola función cada una: InfluxQL 1.x
+    no admite mezclar selectores (PERCENTILE) con agregados (COUNT) en el mismo
+    SELECT. Cacheado por ciclo.
+    """
+    if not ESOD_ENABLE:
+        return {}
+    clave = (geo3, _esod_hist_key(mac))
+    ahora = time.time()
+    hit = _ESOD_HIST_CACHE.get(clave)
+    if hit and (ahora - hit[0]) < 900:
+        return hit[1]
+    hist = {}
+    try:
+        c = _esod_db()
+        base = (f"FROM \"esod_history\" WHERE \"geo3\"='{geo3}' "
+                f"AND \"mac\"='{_esod_hist_key(mac)}' "
+                f"AND time > now() - {ESOD_HIST_DAYS}d "
+                f"GROUP BY \"metric\",\"hod\"")
+        for campo, q in (("p95", f'SELECT PERCENTILE("v",95) AS p95 {base}'),
+                         ("n",   f'SELECT COUNT("v") AS n {base}')):
+            res = c.query(q)
+            for (_, tags), pts in res.items():
+                m = (tags or {}).get("metric"); hod = (tags or {}).get("hod")
+                if not m or hod is None:
+                    continue
+                fila = next(iter(pts), None)
+                if not fila or fila.get(campo) is None:
+                    continue
+                hist.setdefault(m, {}).setdefault(int(hod), {})[campo] = \
+                    float(fila[campo])
+        c.close()
+    except Exception as e:
+        log.debug("esod: no pude leer histórico %s: %s", geo3, e)
+        hist = {}
+    # descarta horas sin muestras suficientes para fiarse
+    limpio = {}
+    for m, horas in hist.items():
+        ok = {h: d for h, d in horas.items()
+              if d.get("n", 0) >= ESOD_HIST_MIN_N and d.get("p95") is not None}
+        if ok:
+            limpio[m] = ok
+    _ESOD_HIST_CACHE[clave] = (ahora, limpio)
+    return limpio
+
+def _esod_rescata(t, v, cand, hist_m):
+    """
+    Dado el vector de candidatos a atípico (cand, booleano), decide a cuáles se
+    les perdona la vida. Devuelve (rescatado_hist, rescatado_run), booleanos.
+
+      fH  -> el valor cabe en la distribución histórica de su hora del día
+             (<= p95 * ESOD_HIST_K).
+      run -> el candidato pertenece a una racha de >= ESOD_RUN_H candidatos
+             consecutivos. Si la racha llega a ESOD_STUCK_H horas con TODOS los
+             valores idénticos, es un sensor atascado y no se rescata. El
+             margen existe porque CanAirIO publica con poca resolución y un
+             episodio real corto puede dar valores repetidos de forma legítima;
+             seis horas clavadas en la misma cifra, no.
+    """
+    n = len(v)
+    r_hist = np.zeros(n, dtype=bool)
+    r_run = np.zeros(n, dtype=bool)
+    if hist_m:
+        for i in np.nonzero(cand)[0]:
+            d = hist_m.get(int((t[i] % 86400) // 3600))
+            if d and float(v[i]) <= d["p95"] * ESOD_HIST_K:
+                r_hist[i] = True
+    if ESOD_RUN_H > 1:
+        i = 0
+        while i < n:
+            if not cand[i]:
+                i += 1; continue
+            j = i
+            while j < n and cand[j]:
+                j += 1
+            tramo = v[i:j]
+            largo = j - i
+            atascado = (largo >= ESOD_STUCK_H
+                        and float(np.std(tramo)) <= 1e-9)
+            if largo >= ESOD_RUN_H and not atascado:
+                r_run[i:j] = True
+            i = j
+    return r_hist, r_run
+
+# ── Repositorio de referencia oficial (fuente futura de TPB-D) ───────────────
+def _ref_hist_save(geo3, provider, series):
+    """
+    Guarda la serie horaria de la cabina oficial en la BD de análisis. Idempotente
+    por timestamp, igual que esod_history. series = {metrica: {epoch_hora: valor}}.
+    """
+    if not REF_HIST_ENABLE or not series:
+        return
+    puntos = []
+    for m, mapa in (series or {}).items():
+        for th, val in (mapa or {}).items():
+            if val is None:
+                continue
+            try:
+                puntos.append({
+                    "measurement": "ref_history",
+                    "tags": {"geo3": geo3, "provider": provider or "oficial",
+                             "metric": m},
+                    "time": int(th) * 1000000000,
+                    "fields": {"v": float(val)},
+                })
+            except (TypeError, ValueError):
+                continue
+    if not puntos:
+        return
+    try:
+        c = _esod_db()
+        c.write_points(puntos, batch_size=5000)
+        c.close()
+    except Exception as e:
+        log.debug("ref_history: no pude grabar %s: %s", geo3, e)
+
+def _gavish_w(beta):
+    """
+    Umbral de valores singulares de Gavish & Donoho (2014), tal como lo usa la
+    tesis en (3.12): w(β) ≈ 0.56β³ − 0.95β² + 1.82β + 1.43, con β = D/M.
+    Solo tiene sentido con β <= 1, es decir M >= D: de ahí el mínimo de 24 días.
+    """
+    return 0.56 * beta**3 - 0.95 * beta**2 + 1.82 * beta + 1.43
+
+def ref_history_state(geo3=None):
+    """
+    Cuántos días completos de cabina hay acumulados por métrica, y si eso basta
+    para plantearse TPB-D (que necesita M >= 24 días de perfiles diarios).
+    """
+    out = {}
+    try:
+        c = _esod_db()
+        w = f"WHERE time > now() - {REF_HIST_DAYS}d"
+        if geo3:
+            w += f" AND \"geo3\"='{geo3}'"
+        res = c.query(f'SELECT COUNT("v") AS n FROM "ref_history" {w} '
+                      f'GROUP BY "geo3","metric",time(1d) fill(none)')
+        c.close()
+        for (_, tags), pts in res.items():
+            g = (tags or {}).get("geo3"); mm = (tags or {}).get("metric")
+            if not g or not mm:
+                continue
+            # ResultSet.items() devuelve GENERADORES, no listas: recorrer 'pts'
+            # dos veces dejaba el segundo cómputo a 0 y salía "1 día, 0 horas".
+            filas = list(pts)
+            # un día cuenta si tiene al menos 20 de las 24 horas: TPB-D trabaja
+            # con vectores diarios de dimensión 24 y un día a medias no sirve
+            dias = sum(1 for p in filas if (p.get("n") or 0) >= 20)
+            horas = sum(int(p.get("n") or 0) for p in filas)
+            if dias or horas:
+                out.setdefault(g, {})[mm] = {"complete_days": dias,
+                                             "hours": horas}
+    except Exception as e:
+        log.debug("ref_history_state: %s", e)
+        return {}
+    for g, metricas in out.items():
+        for mm, d in metricas.items():
+            M = d["complete_days"]
+            d["tpbd_min_days"] = 24
+            d["tpbd_ready"] = bool(M >= 24)
+            if M >= 24:
+                beta = 24.0 / M
+                d["beta"] = round(beta, 3)
+                d["gavish_w"] = round(_gavish_w(beta), 3)
+                d["note"] = (f"{M} días completos: suficiente para estimar κ "
+                             f"(β={beta:.2f}). Entre 40 y 60 días sería cómodo.")
+            else:
+                d["note"] = (f"{M} de 24 días completos. TPB-D necesita M >= 24 "
+                             f"porque β = 24/M debe ser <= 1.")
+    return out
+
+# ── W-UDDR: deriva del factor de corrección (regla α-de-W) ───────────────────
+def detect_factor_drift(geo3):
+    """
+    Lee pm_factor_history (que hasta ahora solo se escribía), agrega por día y
+    aplica la regla α-de-W de la tesis: hay deriva si al menos DRIFT_ALPHA de los
+    DRIFT_W días recientes caen fuera de la banda del historial anterior.
+
+    factor = referencia / sensor. Si el factor SUBE, el sensor lee cada vez más
+    bajo respecto a la cabina: óptica sucia o sensor envejecido. Si BAJA, lee
+    cada vez más alto.
+    """
+    if not DRIFT_ENABLE:
+        return None
+    try:
+        c = _esod_db()
+        # que campos existen de verdad en el measurement
+        campos = set()
+        try:
+            for (_, _tags), pts in c.query(
+                    'SHOW FIELD KEYS FROM "pm_factor_history"').items():
+                for p in pts:
+                    k = p.get("fieldKey")
+                    if k:
+                        campos.add(k)
+        except Exception:
+            pass
+        quiero = [m for m in sorted(PM_CORRECTION_METRICS)
+                  if not campos or f"pm_factor_{m}" in campos]
+        if not quiero:
+            c.close()
+            return None
+        sel = ", ".join(f'MEDIAN("pm_factor_{m}") AS "{m}"' for m in quiero)
+        # GROUP BY "basis": sin separar por base, la mediana diaria mezclaba el
+        # factor derivado de CAMS con el derivado de la cabina y no significaba
+        # nada. Los puntos antiguos no llevan el tag y quedan como mezcla.
+        res = c.query(f'SELECT {sel} FROM "pm_factor_history" '
+                      f'WHERE "geo3"=\'{geo3}\' '
+                      f'AND time > now() - {DRIFT_HIST_DAYS}d '
+                      f'GROUP BY "basis",time(1d) fill(none)')
+        c.close()
+    except Exception as e:
+        log.debug("drift: no pude leer pm_factor_history de %s: %s", geo3, e)
+        return None
+
+    por_base = {}
+    for (_, tags), pts in res.items():
+        b = ((tags or {}).get("basis") or "").strip()
+        por_base.setdefault(b or "mezcla_antigua", []).extend(list(pts))
+    if not por_base:
+        return None
+    # se juzga la base oficial si existe; CAMS solo como respaldo. Nunca la
+    # mezcla antigua (anterior al tag): esos puntos no se pueden atribuir.
+    oficiales = [b for b in por_base if b not in ("cams", "mezcla_antigua")]
+    if oficiales:
+        base_usada = sorted(oficiales, key=lambda b: -len(por_base[b]))[0]
+    elif "cams" in por_base:
+        base_usada = "cams"
+    else:
+        return {"basis": "mezcla_antigua",
+                "bases_available": {k: len(v) for k, v in por_base.items()},
+                "metrics": {},
+                "note": ("todo el historial de factores es anterior a la "
+                         "separación por base de referencia, así que mezcla "
+                         "CAMS con cabina y no se puede interpretar. El "
+                         "historial nuevo ya va etiquetado; vuelve en unos "
+                         "días.")}
+    filas = por_base[base_usada]
+    if not filas:
+        return None
+    out = {}
+    for m in quiero:
+        serie = [float(p[m]) for p in filas
+                 if p.get(m) is not None and p[m] == p[m]]
+        n = len(serie)
+        if n < DRIFT_MIN_DAYS:
+            out[m] = {"status": "sin_historial_suficiente", "days": n,
+                      "days_needed": DRIFT_MIN_DAYS,
+                      "note": (f"{n} de {DRIFT_MIN_DAYS} días de historial de "
+                               f"factor. Aún no se puede hablar de deriva.")}
+            continue
+        base = np.array(serie[:-DRIFT_W], dtype=float)
+        rec = np.array(serie[-DRIFT_W:], dtype=float)
+        if len(base) < 3:
+            out[m] = {"status": "sin_historial_suficiente", "days": n,
+                      "days_needed": DRIFT_W + 3,
+                      "note": "el historial no cubre base y ventana reciente."}
+            continue
+        med = float(np.median(base))
+        mad = float(np.median(np.abs(base - med)))
+        # suelo relativo: sin él, un factor muy estable da banda de anchura 0
+        half = max(DRIFT_K * mad / 0.6745,
+                   abs(med) * DRIFT_BAND_MIN_PCT / 100.0)
+        lo, hi = med - half, med + half
+        fuera = int(np.sum((rec < lo) | (rec > hi)))
+        rec_med = float(np.median(rec))
+        detectada = fuera >= DRIFT_ALPHA
+        cambio = ((rec_med - med) / med * 100.0) if med else None
+        d = {
+            "status": "deriva" if detectada else "estable",
+            "detected": detectada,
+            "days": n,
+            "baseline_days": int(len(base)),
+            "baseline_factor": round(med, 3),
+            "recent_factor": round(rec_med, 3),
+            "band": [round(lo, 3), round(hi, 3)],
+            "window": DRIFT_W,
+            "alpha": DRIFT_ALPHA,
+            "days_out_of_band": fuera,
+            "change_pct": round(cambio, 1) if cambio is not None else None,
+        }
+        if detectada:
+            if rec_med > med:
+                d["direction"] = "sensor_lee_mas_bajo"
+                d["note"] = (
+                    f"el factor ha pasado de x{med:.3f} a x{rec_med:.3f} "
+                    f"({cambio:+.1f} %): el sensor lee cada vez más bajo frente a "
+                    f"la cabina. Típico de óptica sucia o sensor envejecido. "
+                    f"{fuera} de los últimos {DRIFT_W} días fuera de banda.")
+            else:
+                d["direction"] = "sensor_lee_mas_alto"
+                d["note"] = (
+                    f"el factor ha pasado de x{med:.3f} a x{rec_med:.3f} "
+                    f"({cambio:+.1f} %): el sensor lee cada vez más alto frente a "
+                    f"la cabina. Revisa si cambió la estación de referencia antes "
+                    f"de culpar al sensor. {fuera} de los últimos {DRIFT_W} días "
+                    f"fuera de banda.")
+        else:
+            if cambio is not None and abs(cambio) >= 10.0:
+                # no llamar "estable" a un 17 %: lo que pasa es que el factor
+                # varia tanto de un dia a otro que la banda se lo traga
+                d["note"] = (
+                    f"el factor ha pasado de x{med:.3f} a x{rec_med:.3f} "
+                    f"({cambio:+.1f} %), pero varía tanto de un día a otro que la "
+                    f"banda normal es [{lo:.3f}, {hi:.3f}]: con {fuera} de los "
+                    f"últimos {DRIFT_W} días fuera (hacen falta {DRIFT_ALPHA}) "
+                    f"todavía no es deriva, es ruido.")
+                d["status"] = "sin_concluir"
+            else:
+                d["note"] = (f"factor estable en x{rec_med:.3f}; {fuera} de los "
+                             f"últimos {DRIFT_W} días fuera de banda (hacen "
+                             f"falta {DRIFT_ALPHA}).")
+        out[m] = d
+    if not out:
+        return None
+    return {
+        "basis": base_usada,
+        "bases_available": {k: len(v) for k, v in sorted(por_base.items())},
+        "metrics": out,
+        "note": ("factores derivados de "
+                 + ("el modelo CAMS (esta zona no tiene cabina a menos de "
+                    "25 km), así que mide la deriva frente a un modelo, no "
+                    "frente a una medida"
+                    if base_usada == "cams"
+                    else f"la referencia oficial ({base_usada})")),
+    }
+
+# alertas del ciclo anterior, por zona/sensor: es la fuente de prev_alerts
+# que la histeresis necesitaba y que no existia en ningun sitio
+_last_alerts = {}
+
+# ── Limpieza ─────────────────────────────────────────────────────────────────
+def clean_series(t, v, metric, hist=None):
+    """
+    1) Rango físico válido.
+    2) Atípicos por MAD sobre la ventana (ESOD-W) y rescate por histórico o por
+       racha sostenida (ESOD-WH). Ver el bloque ESOD_* arriba.
     3) Interpolación lineal solo de huecos <= MAX_GAP_HOURS.
     Devuelve (t, v, info_dict).
     """
@@ -315,13 +834,24 @@ def clean_series(t, v, metric):
     mask = (v >= lo) & (v <= hi)
     n_range = int((~mask).sum())
     t, v = t[mask], v[mask]
-    n_out = 0
+    n_out = 0; n_rh = 0; n_rr = 0
     if len(v) >= 5:
         med = np.median(v)
         mad = np.median(np.abs(v - med))
         if mad > 0:
             z = 0.6745 * (v - med) / mad
             keep = np.abs(z) <= MAD_FACTOR
+            if ESOD_ENABLE:
+                cand = ~keep
+                # solo se rescatan excursiones por ARRIBA: un valor
+                # anormalmente bajo en un sensor de contaminación es avería
+                # (óptica sucia, sensor ausente), no un episodio.
+                cand &= v > med
+                r_hist, r_run = _esod_rescata(t, v, cand,
+                                              (hist or {}).get(metric))
+                n_rh = int((r_hist & ~r_run).sum())
+                n_rr = int(r_run.sum())
+                keep = keep | r_hist | r_run
             n_out = int((~keep).sum())
             t, v = t[keep], v[keep]
     n_interp = 0
@@ -339,8 +869,18 @@ def clean_series(t, v, metric):
                 gap_ok &= ~bad
         n_interp = int(gap_ok.sum() - len(t)) if gap_ok.sum() > len(t) else 0
         t, v = grid[gap_ok], vi[gap_ok]
-    return t, v, {"dropped_range": n_range, "dropped_outlier": n_out,
-                  "interpolated": max(n_interp, 0)}
+    info = {"dropped_range": n_range, "dropped_outlier": n_out,
+            "interpolated": max(n_interp, 0)}
+    if ESOD_ENABLE and (n_rh or n_rr):
+        # horas que el filtro de ventana habría borrado y ESOD-WH ha salvado
+        info["rescued_history"] = n_rh
+        info["rescued_run"] = n_rr
+        info["rescue_note"] = (
+            f"{n_rh + n_rr} h marcadas como atípicas por la ventana se han "
+            f"conservado: {n_rr} por ser excursión sostenida (>= {ESOD_RUN_H} h) "
+            f"y {n_rh} por caber en la distribución histórica de su hora."
+        )
+    return t, v, info
 
 # ── Estadística ──────────────────────────────────────────────────────────────
 def analyze_series(t, v):
@@ -406,7 +946,7 @@ def detect_alerts(stats_by_metric, confidence=None, prev_alerts=None,
       valor baje por debajo de umbral × (1 - HYSTERESIS).
     """
     HYSTERESIS = float(os.getenv("ALERT_HYSTERESIS", "0.10"))
-    PERSIST_H  = int(os.getenv("ALERT_PERSIST_H", "1"))
+    PERSIST_H  = int(os.getenv("ALERT_PERSIST_H", "2"))
     confidence = confidence or {}
     prev_set = {a["parameter"]: a.get("level") for a in (prev_alerts or [])}
     alerts = []
@@ -671,7 +1211,12 @@ def interpret_comparison(comp, reference="CAMS"):
 # metrica comparando el sensor con la referencia CAMS.
 CONF_RHO_GOOD   = float(os.getenv("CONF_RHO_GOOD", "0.6"))   # rho >= -> bien
 CONF_RHO_FAIR   = float(os.getenv("CONF_RHO_FAIR", "0.3"))   # rho >= -> dudoso
-CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "100"))  # |sesgo%| <= -> ok
+CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "50"))   # |sesgo%| <= -> ok
+# 50 y no 100: con 100, el O3 con -85% de sesgo salia 'fiable' solo porque
+# correlacionaba (rho 0,70). Un sensor que lee el 15% del valor real no es
+# fiable por bien que siga la forma de la curva. Con 50, un sesgo mayor baja a
+# 'dudoso': sigue sirviendo para tendencias y alertas, pero su valor absoluto
+# necesita el factor de correccion antes de darlo por bueno.
 CONF_BIAS_BAD   = float(os.getenv("CONF_BIAS_BAD", "300"))   # |sesgo%| > -> malo
 CONF_MIN_N      = int(os.getenv("CONF_MIN_N", "12"))         # pares minimos
 
@@ -686,13 +1231,128 @@ PM_CORRECTION_METRICS = set(
 # solo corrige si la correlacion es al menos razonable (si no, no tiene sentido)
 PM_CORRECTION_MIN_RHO = float(os.getenv("PM_CORRECTION_MIN_RHO", "0.5"))
 
-# Mapeo zona geo3 -> estación oficial de Euskadi (referencia local).
-# Formato: "geo3:ESTACION,geo3:ESTACION". Para tu zona: ezt -> BARAKALDO.
-# Zonas geo3 que tienen cobertura de estaciones oficiales de Euskadi
-# (la red vasca cubre el entorno de Bilbao/Barakaldo = zona ezt).
+# Zonas con referencia oficial. Vacío (por defecto) = AUTOMÁTICO: se intenta en
+# todas las zonas y cada fuente decide si cubre esa posición.
+#   - euskadi.py  -> ¿hay estación de la red vasca dentro de EUSKADI_RADIUS_KM?
+#   - openaq.py   -> ¿hay estación oficial dentro de OPENAQ_RADIUS_KM?
+# Si ninguna cubre la zona, queda solo CAMS, como antes.
+# Rellenarlo sigue sirviendo para limitar el gasto de red a unas zonas concretas.
 ZONE_HAS_OFFICIAL = set(
-    z.strip() for z in os.getenv("ZONE_HAS_OFFICIAL", "ezt").split(",")
+    z.strip() for z in os.getenv("ZONE_HAS_OFFICIAL", "").split(",")
     if z.strip())
+
+# Centro de zona cacheado: la celda geo3 mide ~156 km de lado, así que su
+# centro geométrico puede caer a 100 km de los sensores reales. Para buscar
+# estaciones oficiales en un radio de 25 km hay que usar el centroide de los
+# sensores que de verdad están emitiendo.
+_zone_center_cache = {}
+ZONE_CENTER_TTL = int(os.getenv("ZONE_CENTER_TTL", "86400"))
+
+
+def zone_sensor_center(geo3, hours=168, mac=None):
+    """
+    Posición de referencia de la zona: centroide (lat, lon) de los sensores
+    activos, decodificado del geohash fino de 7 caracteres.
+
+    Con 'mac' devuelve la posición de ESE sensor, no el centroide. Importa:
+    el centroide de una zona metropolitana puede quedar a varios km de cada
+    sensor (en Bilbao/Barakaldo cae entre los dos), así que al analizar un
+    sensor concreto hay que cotejarlo con las estaciones que tiene al lado,
+    no con la media de toda el área.
+
+    Si no hay posición publicada cae al centro de la celda geo3.
+    Devuelve (lat, lon, n_sensores).
+    """
+    now = time.time()
+    ck = (geo3, mac)
+    hit = _zone_center_cache.get(ck)
+    if hit and now - hit[0] < ZONE_CENTER_TTL:
+        return hit[1]
+    lats, lons = [], []
+    try:
+        c = influx_client()
+        try:
+            where = f"\"geo3\" = '{geo3}' AND time > now() - {int(hours)}h"
+            if mac:
+                where += f" AND \"mac\" = '{mac}'"
+            q = (f'SELECT last("geo") AS geo FROM "{MEASUREMENT}" '
+                 f'WHERE {where} GROUP BY "mac"')
+            for _key, pts in c.query(q).items():
+                g = (next(iter(pts), {}) or {}).get("geo")
+                if not g:
+                    continue
+                try:
+                    la, lo = geohash_center(g)
+                except Exception:
+                    continue
+                lats.append(la)
+                lons.append(lo)
+        finally:
+            c.close()
+    except Exception as e:
+        log.debug("zone_sensor_center(%s, mac=%s) sin posiciones: %s",
+                  geo3, mac, e)
+    if lats:
+        out = (sum(lats) / len(lats), sum(lons) / len(lons), len(lats))
+    elif mac:
+        # el sensor no publica geo: usa el centroide de la zona
+        out = zone_sensor_center(geo3, hours=hours)
+    else:
+        try:
+            la, lo = geohash_center(geo3)
+            out = (la, lo, 0)
+        except Exception:
+            out = (None, None, 0)
+    _zone_center_cache[ck] = (now, out)
+    return out
+
+
+def fetch_official_any(geo3, hours, t_c=None, p_hpa=None, mac=None):
+    """
+    Cadena de referencia oficial: red local (Euskadi) -> OpenAQ global.
+    Con 'mac' la referencia se busca alrededor de ESE sensor.
+    Devuelve (series, source_by_metric, meta) donde meta describe qué fuente
+    respondió. ({}, {}, meta) si ninguna cubre la zona.
+    """
+    lat, lon, nsens = zone_sensor_center(geo3, mac=mac)
+    meta = {"lat": round(lat, 4) if lat is not None else None,
+            "lon": round(lon, 4) if lon is not None else None,
+            "sensors_located": nsens, "provider": None, "stations": [],
+            "centered_on": ("sensor" if mac else "zona"), "mac": mac}
+    if lat is None:
+        return {}, {}, meta
+
+    # 1) red oficial local: mejor referencia (mismo aire, histórico largo)
+    if euskadi.EUSKADI_ENABLED:
+        try:
+            near = euskadi.resolve_stations(lat=lat, lon=lon)
+            if near:
+                off, src = euskadi.fetch_official_series(
+                    hours, lat=lat, lon=lon)
+                if off:
+                    meta["provider"] = "euskadi"
+                    meta["stations"] = [
+                        {"name": s.get("name"), "dist_km": s.get("dist_km")}
+                        for s in near if isinstance(s, dict)]
+                    return off, src, meta
+        except Exception as e:
+            log.warning("referencia Euskadi fallo en %s: %s", geo3, e)
+
+    # 2) OpenAQ: redes oficiales del resto del mundo
+    if openaq.OPENAQ_ENABLED and openaq.OPENAQ_API_KEY:
+        try:
+            off, src = openaq.fetch_official_series(
+                hours, lat=lat, lon=lon, t_c=t_c, p_hpa=p_hpa)
+            if off:
+                meta["provider"] = "openaq"
+                meta["stations"] = [
+                    {"name": l["name"], "country": l["country"]}
+                    for l in openaq.find_locations(lat, lon)]
+                return off, src, meta
+        except Exception as e:
+            log.warning("referencia OpenAQ fallo en %s: %s", geo3, e)
+
+    return {}, {}, meta
 
 def confidence_label(c):
     """
@@ -730,21 +1390,30 @@ def build_confidence(comp):
                   "bias_pct": c.get("bias_pct")}
     return out
 
-def merge_confidence(cams_conf, official_conf):
+def merge_confidence(cams_conf, official_conf, official_source="oficial"):
     """
     Combina la confianza de CAMS y de la estacion oficial tomando, por metrica,
     la MEJOR correlacion de las dos (la referencia mas favorable). Asi un sensor
     no se penaliza por no captar picos locales de la cabina si sigue la tendencia
-    regional (CAMS), ni al reves. Anota que referencia se uso.
+    regional (CAMS), ni al reves. Anota que referencia se uso: 'cams', 'euskadi'
+    u 'openaq'.
     """
+    # Se compara por CALIDAD DEL VEREDICTO y solo se desempata por rho.
+    # Antes se elegia por rho a secas, y eso daba veredictos peores: con PM2.5,
+    # las estaciones oficiales decian 'fiable' (rho 0,64, sesgo -19%) pero
+    # ganaba CAMS con 'dudoso' por tener un rho algo mayor y un sesgo mucho
+    # peor. En empate gana la oficial: es una cabina real del mismo aire.
+    _rango = {"fiable": 3, "dudoso": 2, "no_fiable": 1, "sin_referencia": 0}
     out = dict(cams_conf or {})
     for m, oc in (official_conf or {}).items():
         cc = out.get(m)
         o_rho = abs(oc.get("spearman_rho") or 0)
         c_rho = abs(cc.get("spearman_rho") or 0) if cc else -1
-        if cc is None or o_rho > c_rho:
+        o_r = _rango.get(oc.get("label"), 0)
+        c_r = _rango.get(cc.get("label"), 0) if cc else -1
+        if cc is None or (o_r, o_rho) >= (c_r, c_rho):
             out[m] = dict(oc)
-            out[m]["source"] = "oficial"
+            out[m]["source"] = official_source
         else:
             out[m] = dict(cc)
             out[m]["source"] = "cams"
@@ -753,13 +1422,16 @@ def merge_confidence(cams_conf, official_conf):
         cc.setdefault("source", "cams")
     return out
 
-def pm_corrections(comp):
+def pm_corrections(comp, basis="CAMS"):
     """
-    Factor de correccion por metrica de PM, derivado del cotejo con CAMS:
+    Factor de correccion por metrica de PM:
     factor = reference_mean / sensor_mean (acerca el sensor a la referencia).
     Solo para metricas configuradas y con correlacion suficiente.
-    Devuelve { metric: {factor, corrected_last?} } (corrected_last se rellena
-    luego con el ultimo valor).
+
+    'basis' dice contra que referencia se calculo. Importa: con CAMS salia
+    factor 0,664 para PM2.5 (reduciendo un sensor que YA subestima un 19%),
+    mientras que contra las cabinas oficiales sale ~1,23. Cuando hay estacion
+    oficial, el factor se recalcula con ella.
     """
     out = {}
     if not (PM_CORRECTION_ENABLED and comp):
@@ -773,7 +1445,7 @@ def pm_corrections(comp):
         sm = c.get("sensor_mean"); rm = c.get("reference_mean")
         if sm and rm and sm > 0:
             out[m] = {"factor": round(rm / sm, 3),
-                      "basis": "reference_mean/sensor_mean vs CAMS"}
+                      "basis": f"reference_mean/sensor_mean vs {basis}"}
     return out
 
 # ── Mejora 2: corrección de PM dependiente de la humedad ────────────────────
@@ -1138,6 +1810,13 @@ def compute_caqi(stats_by_metric):
 
 # ── P2.3: Detección de episodios sostenidos ─────────────────────────────────
 EPISODE_MIN_HOURS = int(os.getenv("EPISODE_MIN_HOURS", "2"))  # min duración
+# Métricas que pueden formar un "episodio". Solo contaminantes y ruido: la
+# humedad tiene umbral 80% y en Bilbao eso es un día normal, así que salían
+# "episodios sostenidos de humedad" que no dicen nada de la calidad del aire.
+# La temperatura queda fuera por el mismo motivo (es contexto, no episodio).
+EPISODE_METRICS = set(m.strip() for m in os.getenv(
+    "EPISODE_METRICS", "pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db").split(",")
+    if m.strip())
 
 def detect_episodes(series_clean, confidence=None):
     """
@@ -1147,6 +1826,1135 @@ def detect_episodes(series_clean, confidence=None):
     confidence = confidence or {}
     episodes = []
     for m, (t, v) in series_clean.items():
+        if m not in EPISODE_METRICS:
+            continue
+        if confidence.get(m, {}).get("label") == "no_fiable":
+            continue
+        th = THRESHOLDS.get(m)
+        if not th or len(t) < EPISODE_MIN_HOURS:
+            continue
+        warn = th["warn"]
+        # detectar rachas continuas sobre umbral
+        in_ep = False; ep_start = None; ep_max = None; ep_vals = []
+        for i in range(len(t)):
+            over = float(v[i]) >= warn
+            if over and not in_ep:
+                in_ep = True; ep_start = int(t[i]); ep_vals = [float(v[i])]
+                ep_max = float(v[i])
+            elif over and in_ep:
+                ep_vals.append(float(v[i]))
+                ep_max = max(ep_max, float(v[i]))
+            elif not over and in_ep:
+                if len(ep_vals) >= EPISODE_MIN_HOURS:
+                    episodes.append({
+                        "metric": m,
+                        "start_epoch": ep_start,
+                        "duration_h": len(ep_vals),
+                        "peak": round(ep_max, 2),
+                        "mean": round(float(np.mean(ep_vals)), 2),
+                        "threshold": warn,
+                    })
+                in_ep = False; ep_vals = []
+        if in_ep and len(ep_vals) >= EPISODE_MIN_HOURS:
+            episodes.append({
+                "metric": m,
+                "start_epoch": ep_start,
+                "duration_h": len(ep_vals),
+                "peak": round(ep_max, 2),
+                "mean": round(float(np.mean(ep_vals)), 2),
+                "threshold": warn,
+            })
+    return episodes or None
+
+
+# ── P2.1: Perfil horario (media energética por hora del día) ─────────────────
+def hourly_profile(series_clean):
+    """
+    P2.1: Para cada métrica, media por hora del día (0-23) sobre la ventana
+    de análisis. Permite detectar patrones diurnos y calcular anomalías.
+    """
+    profile = {}
+    for m, (t, v) in series_clean.items():
+        buckets = {}
+        for ti, vi in zip(t, v):
+            h = int((ti % 86400) / 3600)
+            buckets.setdefault(h, []).append(float(vi))
+        if not buckets:
+            continue
+        profile[m] = {
+            str(h): round(float(np.mean(vals)), 2)
+            for h, vals in sorted(buckets.items())
+        }
+    return profile or None
+
+
+# ── P2.5: Correlación PM con lluvia y presión ─────────────────────────────────
+def env_correlations(series_clean, wind_data):
+    """
+    P2.5: Correlación de Spearman PM2.5 con:
+    - Precipitación (lluvia lava partículas: correlación negativa esperada).
+    - Tendencia de presión (presión subiendo = acumulación: correlación positiva).
+    """
+    if not wind_data or "pm25" not in series_clean:
+        return None
+    t_pm, v_pm = series_clean["pm25"]
+    rain_pairs = []; pres_pairs = []
+    p_vals = []
+    for i, ti in enumerate(t_pm):
+        h = int(ti // 3600) * 3600
+        w = wind_data.get(h)
+        if not w or len(w) < 3:
+            continue
+        _, _, prec, pres = w
+        if prec is not None:
+            rain_pairs.append((float(v_pm[i]), prec))
+        if pres is not None:
+            p_vals.append((int(ti), float(v_pm[i]), pres))
+    out = {}
+    if len(rain_pairs) >= 12:
+        pm_r = np.array([x[0] for x in rain_pairs])
+        rain = np.array([x[1] for x in rain_pairs])
+        rho, p = sps.spearmanr(pm_r, rain)
+        if rho == rho:
+            out["pm25_vs_rain"] = {
+                "spearman_rho": round(float(rho), 2),
+                "p_value": round(float(p), 4),
+                "n": len(rain_pairs),
+                "note": ("lluvia lava PM (normal)" if rho < -0.2
+                         else "sin efecto de lavado claro"),
+            }
+    if len(p_vals) >= 12:
+        # tendencia de presión: diferencia entre hora actual y 3h antes
+        pres_trend = []
+        for i in range(3, len(p_vals)):
+            t0, pm0, ps0 = p_vals[i]
+            _, _, ps_ant = p_vals[i - 3]
+            pres_trend.append((pm0, ps0 - ps_ant))
+        if len(pres_trend) >= 12:
+            pm_p = np.array([x[0] for x in pres_trend])
+            dp = np.array([x[1] for x in pres_trend])
+            rho2, p2 = sps.spearmanr(pm_p, dp)
+            if rho2 == rho2:
+                out["pm25_vs_pressure_trend"] = {
+                    "spearman_rho": round(float(rho2), 2),
+                    "p_value": round(float(p2), 4),
+                    "n": len(pres_trend),
+                    "note": ("presion subiendo acumula PM" if rho2 > 0.2
+                             else "sin efecto claro de presion"),
+                }
+    return out or None
+
+# alertas del ciclo anterior, por zona/sensor: es la fuente de prev_alerts
+# que la histeresis necesitaba y que no existia en ningun sitio
+_last_alerts = {}
+
+# ── Limpieza ─────────────────────────────────────────────────────────────────
+def clean_series(t, v, metric, hist=None):
+    """
+    1) Rango físico válido.
+    2) Atípicos por MAD sobre la ventana (ESOD-W) y rescate por histórico o por
+       racha sostenida (ESOD-WH). Ver el bloque ESOD_* arriba.
+    3) Interpolación lineal solo de huecos <= MAX_GAP_HOURS.
+    Devuelve (t, v, info_dict).
+    """
+    lo, hi = METRICS[metric]["range"]
+    mask = (v >= lo) & (v <= hi)
+    n_range = int((~mask).sum())
+    t, v = t[mask], v[mask]
+    n_out = 0; n_rh = 0; n_rr = 0
+    if len(v) >= 5:
+        med = np.median(v)
+        mad = np.median(np.abs(v - med))
+        if mad > 0:
+            z = 0.6745 * (v - med) / mad
+            keep = np.abs(z) <= MAD_FACTOR
+            if ESOD_ENABLE:
+                cand = ~keep
+                # solo se rescatan excursiones por ARRIBA: un valor
+                # anormalmente bajo en un sensor de contaminación es avería
+                # (óptica sucia, sensor ausente), no un episodio.
+                cand &= v > med
+                r_hist, r_run = _esod_rescata(t, v, cand,
+                                              (hist or {}).get(metric))
+                n_rh = int((r_hist & ~r_run).sum())
+                n_rr = int(r_run.sum())
+                keep = keep | r_hist | r_run
+            n_out = int((~keep).sum())
+            t, v = t[keep], v[keep]
+    n_interp = 0
+    if len(v) >= 3:
+        # interpola huecos horarios pequeños sobre una rejilla por hora
+        t0, t1 = t[0], t[-1]
+        grid = np.arange(t0, t1 + 1, 3600.0)
+        vi = np.interp(grid, t, v)
+        # invalida tramos cuyo hueco original supera MAX_GAP_HOURS
+        gap_ok = np.ones_like(grid, dtype=bool)
+        max_gap = MAX_GAP_HOURS * 3600.0
+        for i in range(len(t) - 1):
+            if (t[i + 1] - t[i]) > max_gap:
+                bad = (grid > t[i]) & (grid < t[i + 1])
+                gap_ok &= ~bad
+        n_interp = int(gap_ok.sum() - len(t)) if gap_ok.sum() > len(t) else 0
+        t, v = grid[gap_ok], vi[gap_ok]
+    info = {"dropped_range": n_range, "dropped_outlier": n_out,
+            "interpolated": max(n_interp, 0)}
+    if ESOD_ENABLE and (n_rh or n_rr):
+        # horas que el filtro de ventana habría borrado y ESOD-WH ha salvado
+        info["rescued_history"] = n_rh
+        info["rescued_run"] = n_rr
+        info["rescue_note"] = (
+            f"{n_rh + n_rr} h marcadas como atípicas por la ventana se han "
+            f"conservado: {n_rr} por ser excursión sostenida (>= {ESOD_RUN_H} h) "
+            f"y {n_rh} por caber en la distribución histórica de su hora."
+        )
+    return t, v, info
+
+# ── Estadística ──────────────────────────────────────────────────────────────
+def analyze_series(t, v):
+    """
+    Tendencia: Mann-Kendall (tau de Kendall vs tiempo) + pendiente Theil-Sen.
+    Incertidumbre: IC95% de la media (t de Student sobre el error estándar).
+    """
+    n = len(v)
+    mean = float(np.mean(v)); std = float(np.std(v, ddof=1)) if n > 1 else 0.0
+    sem = std / math.sqrt(n) if n > 1 else 0.0
+    tcrit = sps.t.ppf(0.975, n - 1) if n > 1 else 0.0
+    th = t / 3600.0  # horas, para pendiente en unidades/hora
+    tau, p_mk = sps.kendalltau(th, v)
+    slope, intercept, slo, shi = sps.theilslopes(v, th, 0.95)
+    if p_mk is None or np.isnan(p_mk):
+        trend = "indeterminada"
+    elif p_mk >= 0.05:
+        trend = "estable"
+    else:
+        trend = "creciente" if slope > 0 else "decreciente"
+    return {
+        "n": n,
+        "mean": round(mean, 2),
+        "std": round(std, 2),
+        "min": round(float(np.min(v)), 2),
+        "max": round(float(np.max(v)), 2),
+        "p95": round(float(np.percentile(v, 95)), 2),
+        "ci95_mean": [round(mean - tcrit * sem, 2), round(mean + tcrit * sem, 2)],
+        "trend": trend,
+        "kendall_tau": round(float(tau), 3) if tau == tau else None,
+        "p_value": round(float(p_mk), 4) if p_mk == p_mk else None,
+        "slope_per_hour": round(float(slope), 4),
+        "slope_ci95": [round(float(slo), 4), round(float(shi), 4)],
+        "last_value": round(float(v[-1]), 2),
+    }
+
+def correlations(series_clean):
+    """Spearman entre pares de contaminantes con suficientes puntos comunes."""
+    keys = [k for k in ("pm25", "pm10", "no2", "o3", "co2", "db", "tmp", "hum")
+            if k in series_clean]
+    out = []
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            a, b = keys[i], keys[j]
+            ta, va = series_clean[a]; tb, vb = series_clean[b]
+            common, ia, ib = np.intersect1d(ta, tb, return_indices=True)
+            if len(common) < 12:
+                continue
+            rho, p = sps.spearmanr(va[ia], vb[ib])
+            if p == p and p < 0.05 and abs(rho) >= 0.4:
+                out.append({"pair": f"{a}~{b}", "spearman_rho": round(float(rho), 2),
+                            "p_value": round(float(p), 4), "n": int(len(common))})
+    return out
+
+def detect_alerts(stats_by_metric, confidence=None, prev_alerts=None,
+                  series_recent=None):
+    """
+    P1.3 — Persistencia e histéresis:
+    - Persistencia: la alerta requiere que al menos ALERT_PERSIST_H horas
+      consecutivas recientes superen el umbral (no solo el último dato).
+      Si series_recent no está disponible, actúa igual que antes (compatible).
+    - Histéresis: una alerta activa (prev_alerts) se mantiene hasta que el
+      valor baje por debajo de umbral × (1 - HYSTERESIS).
+    """
+    HYSTERESIS = float(os.getenv("ALERT_HYSTERESIS", "0.10"))
+    PERSIST_H  = int(os.getenv("ALERT_PERSIST_H", "2"))
+    confidence = confidence or {}
+    prev_set = {a["parameter"]: a.get("level") for a in (prev_alerts or [])}
+    alerts = []
+    for m, s in stats_by_metric.items():
+        th = THRESHOLDS.get(m)
+        if not th:
+            continue
+        conf = confidence.get(m, {}).get("label")
+        if conf == "no_fiable":
+            continue
+        val = s.get("last_value")
+        if val is None:
+            continue
+        was_active = prev_set.get(m)
+        level = None; thr = None
+        for lvl, umb in [("critical", th["critical"]), ("warning", th["warn"])]:
+            if val < umb:
+                continue
+            # persistencia: si tenemos series recientes, verificar N horas
+            if series_recent and m in series_recent and PERSIST_H > 1:
+                _, v_rec = series_recent[m]
+                # contar cuántos de los últimos PERSIST_H valores superan el umbral
+                recent_vals = v_rec[-PERSIST_H:] if len(v_rec) >= PERSIST_H else v_rec
+                n_over = int(np.sum(recent_vals >= umb))
+                if n_over < min(PERSIST_H, len(recent_vals)):
+                    continue   # no persistente aún
+            level = lvl; thr = umb; break
+        # histéresis: mantener alerta activa hasta bajar HYSTERESIS%
+        if level is None and was_active:
+            for lvl, umb in [("critical", th["critical"]), ("warning", th["warn"])]:
+                if was_active == lvl and val >= umb * (1 - HYSTERESIS):
+                    level = lvl; thr = umb; break
+        if level:
+            alerts.append({"parameter": m, "value": val, "level": level,
+                           "threshold": thr,
+                           "confidence": conf or "sin_referencia"})
+    return alerts
+
+# ── Clima Open-Meteo (con caché en memoria) ─────────────────────────────────
+_weather_cache = {}
+
+def fetch_weather(geo3):
+    now = time.time()
+    hit = _weather_cache.get(geo3)
+    if hit and now - hit[0] < WEATHER_CACHE_TTL:
+        return hit[1]
+    lat, lon = geohash_center(geo3)
+    params = {
+        "latitude": round(lat, 4), "longitude": round(lon, 4),
+        "hourly": ("temperature_2m,relative_humidity_2m,precipitation,"
+                   "wind_speed_10m,wind_direction_10m,surface_pressure,"
+                   "weathercode,cloud_cover,visibility,uv_index,"
+                   "snowfall,precipitation_probability"),
+        "past_hours": 24, "forecast_hours": 12,
+        "wind_speed_unit": "kmh", "timezone": "UTC",
+    }
+    r = requests.get(OPEN_METEO_URL, params=params, timeout=30)
+    r.raise_for_status()
+    h = r.json().get("hourly", {})
+    times = h.get("time", [])
+    if not times:
+        return None
+    k = min(24, len(times) - 1)
+    def at(name, idx):
+        arr = h.get(name) or []
+        return arr[idx] if idx < len(arr) and arr[idx] is not None else None
+    def seg(name, a, b):
+        arr = [x for x in (h.get(name) or [])[a:b] if x is not None]
+        return arr
+    wind_now  = at("wind_speed_10m", k)
+    wdir_now  = at("wind_direction_10m", k)
+    wcode_now = at("weathercode", k)
+    fc_wind   = seg("wind_speed_10m", k, k + 12)
+    fc_prec   = seg("precipitation", k, k + 12)
+    fc_snow   = seg("snowfall", k, k + 12)
+    fc_prob   = seg("precipitation_probability", k, k + 12)
+    past_wind = seg("wind_speed_10m", max(0, k - 24), k)
+    w = {
+        "lat": round(lat, 3), "lon": round(lon, 3),
+        "now": {
+            "temperature_c":  at("temperature_2m", k),
+            "humidity_pct":   at("relative_humidity_2m", k),
+            "wind_kmh":       wind_now,
+            "wind_dir_deg":   wdir_now,
+            "wind_dir_txt":   wind_dir_text(wdir_now),
+            "pressure_hpa":   at("surface_pressure", k),
+            "cloud_cover_pct": at("cloud_cover", k),
+            "visibility_km":  round(at("visibility", k) / 1000, 1)
+                              if at("visibility", k) is not None else None,
+            "uv_index":       at("uv_index", k),
+            "weathercode":    wcode_now,
+            "weather_desc":   weathercode_desc(wcode_now),
+            "weather_icon":   weathercode_icon(wcode_now),
+        },
+        "past24h": {
+            "wind_mean_kmh":  round(float(np.mean(past_wind)), 1) if past_wind else None,
+            "precip_total_mm": round(float(np.sum(seg("precipitation", max(0, k-24), k))), 1),
+        },
+        "next12h": {
+            "wind_mean_kmh":  round(float(np.mean(fc_wind)), 1) if fc_wind else None,
+            "wind_max_kmh":   round(float(np.max(fc_wind)), 1) if fc_wind else None,
+            "precip_total_mm": round(float(np.sum(fc_prec)), 1) if fc_prec else None,
+            "snow_total_cm":  round(float(np.sum(fc_snow)), 1) if fc_snow else None,
+            "precip_prob_max_pct": int(max(fc_prob)) if fc_prob else None,
+        },
+    }
+    _weather_cache[geo3] = (now, w)
+    return w
+
+def wind_dir_text(deg):
+    if deg is None:
+        return None
+    dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSO", "SO", "OSO", "O", "ONO", "NO", "NNO"]
+    return dirs[int((deg + 11.25) // 22.5) % 16]
+
+
+# Códigos WMO (weathercode) de Open-Meteo → descripción en español e icono emoji
+_WMO = {
+    0:  ("Despejado",               "☀️"),
+    1:  ("Mayormente despejado",     "🌤️"),
+    2:  ("Parcialmente nublado",     "⛅"),
+    3:  ("Nublado",                  "☁️"),
+    45: ("Niebla",                   "🌫️"),
+    48: ("Niebla con escarcha",      "🌫️"),
+    51: ("Llovizna ligera",          "🌦️"),
+    53: ("Llovizna moderada",        "🌦️"),
+    55: ("Llovizna intensa",         "🌧️"),
+    61: ("Lluvia ligera",            "🌧️"),
+    63: ("Lluvia moderada",          "🌧️"),
+    65: ("Lluvia intensa",           "🌧️"),
+    66: ("Lluvia helada ligera",     "🌨️"),
+    67: ("Lluvia helada intensa",    "🌨️"),
+    71: ("Nevada ligera",            "❄️"),
+    73: ("Nevada moderada",          "❄️"),
+    75: ("Nevada intensa",           "❄️"),
+    77: ("Granizo",                  "🌨️"),
+    80: ("Chubascos ligeros",        "🌦️"),
+    81: ("Chubascos moderados",      "🌧️"),
+    82: ("Chubascos violentos",      "⛈️"),
+    85: ("Chubascos de nieve",       "❄️"),
+    86: ("Chubascos de nieve fuerte","❄️"),
+    95: ("Tormenta",                 "⛈️"),
+    96: ("Tormenta con granizo",     "⛈️"),
+    99: ("Tormenta con granizo fuerte","⛈️"),
+}
+
+def weathercode_desc(code):
+    if code is None:
+        return None
+    return _WMO.get(int(code), ("Desconocido", "🌡️"))[0]
+
+def weathercode_icon(code):
+    if code is None:
+        return None
+    return _WMO.get(int(code), ("Desconocido", "🌡️"))[1]
+
+# ── Comparación con referencia regional CAMS (Copernicus) ───────────────────
+# Mapeo metrica del sensor -> variable equivalente en la API de Open-Meteo AQ.
+SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "no2": "nitrogen_dioxide",
+            "o3": "ozone"}
+_sat_cache = {}
+
+def fetch_reference(geo3, hours):
+    """
+    Serie horaria de referencia CAMS (modelo europeo 11 km, satelite+estaciones)
+    en el centro del geohash. Incluye AOD (espesor optico de aerosoles).
+    Devuelve dict: { var_sensor: {epoch_s: valor} , "aod": {...} }.
+    """
+    now = time.time()
+    key = (geo3, hours)
+    hit = _sat_cache.get(key)
+    if hit and now - hit[0] < SATCOMP_CACHE_TTL:
+        return hit[1]
+    lat, lon = geohash_center(geo3)
+    past_days = max(1, min(92, (hours // 24) + 1))
+    hourly = ",".join(list(SAT_VARS.values()) + ["aerosol_optical_depth"])
+    params = {"latitude": round(lat, 4), "longitude": round(lon, 4),
+              "hourly": hourly, "past_days": past_days, "forecast_days": 1,
+              "timezone": "UTC"}
+    r = requests.get(OPEN_METEO_AQ_URL, params=params, timeout=30)
+    r.raise_for_status()
+    h = r.json().get("hourly", {})
+    times = h.get("time", [])
+    def to_epoch(s):
+        return int(time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M"))) \
+               - time.timezone
+    idx = {}
+    for i, t in enumerate(times):
+        idx[i] = to_epoch(t)
+    out = {}
+    for sensor_key, api_key in SAT_VARS.items():
+        arr = h.get(api_key) or []
+        out[sensor_key] = {idx[i]: arr[i] for i in range(len(arr))
+                           if i in idx and arr[i] is not None}
+    aod = h.get("aerosol_optical_depth") or []
+    out["aod"] = {idx[i]: aod[i] for i in range(len(aod))
+                  if i in idx and aod[i] is not None}
+    _sat_cache[key] = (now, out)
+    return out
+
+def compare_with_reference(series_clean, reference):
+    """
+    Correlaciona (Spearman) cada metrica del sensor con la referencia CAMS,
+    alineando por hora. Calcula tambien el sesgo medio sensor-referencia.
+    series_clean: { metric: (t_ndarray, v_ndarray) } ya limpio.
+    """
+    results = {}
+    for m, ref_map in reference.items():
+        if m == "aod" or m not in series_clean or not ref_map:
+            continue
+        t, v = series_clean[m]
+        # alinea por hora redondeando el timestamp del sensor a la hora CAMS
+        pairs = []
+        for ti, vi in zip(t, v):
+            hour = int(ti // 3600) * 3600
+            if hour in ref_map:
+                pairs.append((vi, ref_map[hour]))
+        if len(pairs) < 12:
+            continue
+        sv = np.array([p[0] for p in pairs])
+        rv = np.array([p[1] for p in pairs])
+        rho, p = sps.spearmanr(sv, rv)
+        bias = float(np.mean(sv - rv))
+        rel = (100.0 * bias / np.mean(rv)) if np.mean(rv) != 0 else None
+        results[m] = {
+            "n": len(pairs),
+            "spearman_rho": round(float(rho), 2) if rho == rho else None,
+            "p_value": round(float(p), 4) if p == p else None,
+            "sensor_mean": round(float(np.mean(sv)), 2),
+            "reference_mean": round(float(np.mean(rv)), 2),
+            "bias": round(bias, 2),
+            "bias_pct": round(rel, 1) if rel is not None else None,
+        }
+    # AOD no tiene equivalente directo en el sensor; lo reportamos como contexto
+    if reference.get("aod"):
+        vals = list(reference["aod"].values())
+        results["_aod_reference"] = {"mean": round(float(np.mean(vals)), 3),
+                                     "max": round(float(np.max(vals)), 3),
+                                     "note": "espesor optico de aerosoles (columna)"}
+    return results
+
+def interpret_comparison(comp, reference="CAMS"):
+    """Resumen legible del cotejo sensor vs referencia (CAMS u oficial)."""
+    notes = []
+    for m, c in comp.items():
+        if m.startswith("_") or c.get("spearman_rho") is None:
+            continue
+        label = METRICS.get(m, {}).get("label", m)
+        rho = c["spearman_rho"]; bias = c["bias_pct"]
+        corr = ("alta" if rho >= 0.7 else "media" if rho >= 0.4
+                else "baja")
+        txt = f"{label}: correlacion {corr} (rho={rho})"
+        if bias is not None and abs(bias) >= 25:
+            signo = "sobreestima" if bias > 0 else "subestima"
+            txt += f"; el sensor {signo} ~{abs(bias):.0f}% vs {reference}"
+        notes.append(txt)
+    return notes
+
+# ── Etiqueta de confianza por métrica ───────────────────────────────────────
+# Umbrales (ajustables por entorno) para clasificar la fiabilidad de cada
+# metrica comparando el sensor con la referencia CAMS.
+CONF_RHO_GOOD   = float(os.getenv("CONF_RHO_GOOD", "0.6"))   # rho >= -> bien
+CONF_RHO_FAIR   = float(os.getenv("CONF_RHO_FAIR", "0.3"))   # rho >= -> dudoso
+CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "50"))   # |sesgo%| <= -> ok
+# 50 y no 100: con 100, el O3 con -85% de sesgo salia 'fiable' solo porque
+# correlacionaba (rho 0,70). Un sensor que lee el 15% del valor real no es
+# fiable por bien que siga la forma de la curva. Con 50, un sesgo mayor baja a
+# 'dudoso': sigue sirviendo para tendencias y alertas, pero su valor absoluto
+# necesita el factor de correccion antes de darlo por bueno.
+CONF_BIAS_BAD   = float(os.getenv("CONF_BIAS_BAD", "300"))   # |sesgo%| > -> malo
+CONF_MIN_N      = int(os.getenv("CONF_MIN_N", "12"))         # pares minimos
+
+# Correccion de PM: los sensores opticos baratos subestiman de forma
+# consistente frente a CAMS. Si se activa, se calcula un factor por metrica
+# (reference_mean / sensor_mean) y se expone el valor corregido junto al crudo.
+# No modifica los datos crudos; solo informa el valor ajustado.
+PM_CORRECTION_ENABLED = os.getenv("PM_CORRECTION_ENABLED", "1") == "1"
+PM_CORRECTION_METRICS = set(
+    x.strip() for x in os.getenv("PM_CORRECTION_METRICS", "pm25,pm10,pm1").split(",")
+    if x.strip())
+# solo corrige si la correlacion es al menos razonable (si no, no tiene sentido)
+PM_CORRECTION_MIN_RHO = float(os.getenv("PM_CORRECTION_MIN_RHO", "0.5"))
+
+# Zonas con referencia oficial. Vacío (por defecto) = AUTOMÁTICO: se intenta en
+# todas las zonas y cada fuente decide si cubre esa posición.
+#   - euskadi.py  -> ¿hay estación de la red vasca dentro de EUSKADI_RADIUS_KM?
+#   - openaq.py   -> ¿hay estación oficial dentro de OPENAQ_RADIUS_KM?
+# Si ninguna cubre la zona, queda solo CAMS, como antes.
+# Rellenarlo sigue sirviendo para limitar el gasto de red a unas zonas concretas.
+ZONE_HAS_OFFICIAL = set(
+    z.strip() for z in os.getenv("ZONE_HAS_OFFICIAL", "").split(",")
+    if z.strip())
+
+# Centro de zona cacheado: la celda geo3 mide ~156 km de lado, así que su
+# centro geométrico puede caer a 100 km de los sensores reales. Para buscar
+# estaciones oficiales en un radio de 25 km hay que usar el centroide de los
+# sensores que de verdad están emitiendo.
+_zone_center_cache = {}
+ZONE_CENTER_TTL = int(os.getenv("ZONE_CENTER_TTL", "86400"))
+
+
+def zone_sensor_center(geo3, hours=168, mac=None):
+    """
+    Posición de referencia de la zona: centroide (lat, lon) de los sensores
+    activos, decodificado del geohash fino de 7 caracteres.
+
+    Con 'mac' devuelve la posición de ESE sensor, no el centroide. Importa:
+    el centroide de una zona metropolitana puede quedar a varios km de cada
+    sensor (en Bilbao/Barakaldo cae entre los dos), así que al analizar un
+    sensor concreto hay que cotejarlo con las estaciones que tiene al lado,
+    no con la media de toda el área.
+
+    Si no hay posición publicada cae al centro de la celda geo3.
+    Devuelve (lat, lon, n_sensores).
+    """
+    now = time.time()
+    ck = (geo3, mac)
+    hit = _zone_center_cache.get(ck)
+    if hit and now - hit[0] < ZONE_CENTER_TTL:
+        return hit[1]
+    lats, lons = [], []
+    try:
+        c = influx_client()
+        try:
+            where = f"\"geo3\" = '{geo3}' AND time > now() - {int(hours)}h"
+            if mac:
+                where += f" AND \"mac\" = '{mac}'"
+            q = (f'SELECT last("geo") AS geo FROM "{MEASUREMENT}" '
+                 f'WHERE {where} GROUP BY "mac"')
+            for _key, pts in c.query(q).items():
+                g = (next(iter(pts), {}) or {}).get("geo")
+                if not g:
+                    continue
+                try:
+                    la, lo = geohash_center(g)
+                except Exception:
+                    continue
+                lats.append(la)
+                lons.append(lo)
+        finally:
+            c.close()
+    except Exception as e:
+        log.debug("zone_sensor_center(%s, mac=%s) sin posiciones: %s",
+                  geo3, mac, e)
+    if lats:
+        out = (sum(lats) / len(lats), sum(lons) / len(lons), len(lats))
+    elif mac:
+        # el sensor no publica geo: usa el centroide de la zona
+        out = zone_sensor_center(geo3, hours=hours)
+    else:
+        try:
+            la, lo = geohash_center(geo3)
+            out = (la, lo, 0)
+        except Exception:
+            out = (None, None, 0)
+    _zone_center_cache[ck] = (now, out)
+    return out
+
+
+def fetch_official_any(geo3, hours, t_c=None, p_hpa=None, mac=None):
+    """
+    Cadena de referencia oficial: red local (Euskadi) -> OpenAQ global.
+    Con 'mac' la referencia se busca alrededor de ESE sensor.
+    Devuelve (series, source_by_metric, meta) donde meta describe qué fuente
+    respondió. ({}, {}, meta) si ninguna cubre la zona.
+    """
+    lat, lon, nsens = zone_sensor_center(geo3, mac=mac)
+    meta = {"lat": round(lat, 4) if lat is not None else None,
+            "lon": round(lon, 4) if lon is not None else None,
+            "sensors_located": nsens, "provider": None, "stations": [],
+            "centered_on": ("sensor" if mac else "zona"), "mac": mac}
+    if lat is None:
+        return {}, {}, meta
+
+    # 1) red oficial local: mejor referencia (mismo aire, histórico largo)
+    if euskadi.EUSKADI_ENABLED:
+        try:
+            near = euskadi.resolve_stations(lat=lat, lon=lon)
+            if near:
+                off, src = euskadi.fetch_official_series(
+                    hours, lat=lat, lon=lon)
+                if off:
+                    meta["provider"] = "euskadi"
+                    meta["stations"] = [
+                        {"name": s.get("name"), "dist_km": s.get("dist_km")}
+                        for s in near if isinstance(s, dict)]
+                    return off, src, meta
+        except Exception as e:
+            log.warning("referencia Euskadi fallo en %s: %s", geo3, e)
+
+    # 2) OpenAQ: redes oficiales del resto del mundo
+    if openaq.OPENAQ_ENABLED and openaq.OPENAQ_API_KEY:
+        try:
+            off, src = openaq.fetch_official_series(
+                hours, lat=lat, lon=lon, t_c=t_c, p_hpa=p_hpa)
+            if off:
+                meta["provider"] = "openaq"
+                meta["stations"] = [
+                    {"name": l["name"], "country": l["country"]}
+                    for l in openaq.find_locations(lat, lon)]
+                return off, src, meta
+        except Exception as e:
+            log.warning("referencia OpenAQ fallo en %s: %s", geo3, e)
+
+    return {}, {}, meta
+
+def confidence_label(c):
+    """
+    Devuelve 'fiable' | 'dudoso' | 'no_fiable' | 'sin_referencia' para una
+    metrica, a partir de su comparacion con CAMS (rho + sesgo + nº de pares).
+    Reglas:
+      - correlacion negativa fuerte (rho <= -CONF_RHO_FAIR) -> no_fiable
+        (el sensor se mueve al reves que la referencia: sintoma claro de fallo)
+      - rho alto y sesgo contenido -> fiable
+      - rho bajo o sesgo enorme -> no_fiable
+      - intermedio -> dudoso
+    """
+    if not c or c.get("spearman_rho") is None or c.get("n", 0) < CONF_MIN_N:
+        return "sin_referencia"
+    rho = c["spearman_rho"]
+    bias = abs(c["bias_pct"]) if c.get("bias_pct") is not None else 0.0
+    if rho <= -CONF_RHO_FAIR:
+        return "no_fiable"
+    if rho >= CONF_RHO_GOOD and bias <= CONF_BIAS_FAIR:
+        return "fiable"
+    if rho < CONF_RHO_FAIR or bias > CONF_BIAS_BAD:
+        return "no_fiable"
+    return "dudoso"
+
+def build_confidence(comp):
+    """Mapa metrica -> {label, rho, bias_pct} a partir de la comparacion."""
+    out = {}
+    if not comp:
+        return out
+    for m, c in comp.items():
+        if m.startswith("_"):
+            continue
+        out[m] = {"label": confidence_label(c),
+                  "spearman_rho": c.get("spearman_rho"),
+                  "bias_pct": c.get("bias_pct")}
+    return out
+
+def merge_confidence(cams_conf, official_conf, official_source="oficial"):
+    """
+    Combina la confianza de CAMS y de la estacion oficial tomando, por metrica,
+    la MEJOR correlacion de las dos (la referencia mas favorable). Asi un sensor
+    no se penaliza por no captar picos locales de la cabina si sigue la tendencia
+    regional (CAMS), ni al reves. Anota que referencia se uso: 'cams', 'euskadi'
+    u 'openaq'.
+    """
+    # Se compara por CALIDAD DEL VEREDICTO y solo se desempata por rho.
+    # Antes se elegia por rho a secas, y eso daba veredictos peores: con PM2.5,
+    # las estaciones oficiales decian 'fiable' (rho 0,64, sesgo -19%) pero
+    # ganaba CAMS con 'dudoso' por tener un rho algo mayor y un sesgo mucho
+    # peor. En empate gana la oficial: es una cabina real del mismo aire.
+    _rango = {"fiable": 3, "dudoso": 2, "no_fiable": 1, "sin_referencia": 0}
+    out = dict(cams_conf or {})
+    for m, oc in (official_conf or {}).items():
+        cc = out.get(m)
+        o_rho = abs(oc.get("spearman_rho") or 0)
+        c_rho = abs(cc.get("spearman_rho") or 0) if cc else -1
+        o_r = _rango.get(oc.get("label"), 0)
+        c_r = _rango.get(cc.get("label"), 0) if cc else -1
+        if cc is None or (o_r, o_rho) >= (c_r, c_rho):
+            out[m] = dict(oc)
+            out[m]["source"] = official_source
+        else:
+            out[m] = dict(cc)
+            out[m]["source"] = "cams"
+    # marca las que solo tenian CAMS
+    for m, cc in out.items():
+        cc.setdefault("source", "cams")
+    return out
+
+def pm_corrections(comp, basis="CAMS"):
+    """
+    Factor de correccion por metrica de PM:
+    factor = reference_mean / sensor_mean (acerca el sensor a la referencia).
+    Solo para metricas configuradas y con correlacion suficiente.
+
+    'basis' dice contra que referencia se calculo. Importa: con CAMS salia
+    factor 0,664 para PM2.5 (reduciendo un sensor que YA subestima un 19%),
+    mientras que contra las cabinas oficiales sale ~1,23. Cuando hay estacion
+    oficial, el factor se recalcula con ella.
+    """
+    out = {}
+    if not (PM_CORRECTION_ENABLED and comp):
+        return out
+    for m in PM_CORRECTION_METRICS:
+        c = comp.get(m)
+        if not c or c.get("spearman_rho") is None:
+            continue
+        if c["spearman_rho"] < PM_CORRECTION_MIN_RHO:
+            continue
+        sm = c.get("sensor_mean"); rm = c.get("reference_mean")
+        if sm and rm and sm > 0:
+            out[m] = {"factor": round(rm / sm, 3),
+                      "basis": f"reference_mean/sensor_mean vs {basis}"}
+    return out
+
+# ── Mejora 2: corrección de PM dependiente de la humedad ────────────────────
+# Los sensores ópticos inflan la lectura con humedad alta (las partículas
+# absorben agua). Ajustamos por mínimos cuadrados: ref ≈ a·PM + b·HR + c,
+# y comparamos contra el modelo simple de factor para quedarnos con el mejor.
+def humidity_pm_model(series_clean, ref_map, metric):
+    if metric not in series_clean or "hum" not in series_clean or not ref_map:
+        return None
+    t_pm, v_pm = series_clean[metric]
+    hum_map = {int(t // 3600) * 3600: v
+               for t, v in zip(*series_clean["hum"])}
+    rows = []
+    for ti, vi in zip(t_pm, v_pm):
+        h = int(ti // 3600) * 3600
+        if h in hum_map and h in ref_map:
+            rows.append((float(vi), float(hum_map[h]), float(ref_map[h])))
+    if len(rows) < 24:      # exige al menos un día de horas comunes
+        return None
+    A = np.array([[r[0], r[1], 1.0] for r in rows])
+    y = np.array([r[2] for r in rows])
+    try:
+        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    a, b, c = (float(x) for x in coef)
+    if a <= 0:              # sin sentido físico: descarta
+        return None
+    pred = A @ coef
+    rmse_rh = float(np.sqrt(np.mean((pred - y) ** 2)))
+    # modelo simple (factor) sobre las MISMAS horas, para comparar en igualdad
+    mean_pm = float(np.mean(A[:, 0]))
+    f = float(np.mean(y) / mean_pm) if mean_pm > 0 else None
+    rmse_lin = (float(np.sqrt(np.mean((A[:, 0] * f - y) ** 2)))
+                if f else None)
+    better = rmse_lin is not None and rmse_rh < rmse_lin * 0.95  # mejora >5%
+    return {
+        "coef": {"a_pm": round(a, 3), "b_rh": round(b, 3), "c": round(c, 2)},
+        "n": len(rows),
+        "rmse_rh_model": round(rmse_rh, 2),
+        "rmse_factor_model": round(rmse_lin, 2) if rmse_lin else None,
+        "better_than_factor": bool(better),
+    }
+
+
+def apply_humidity_correction(model, pm_last, rh_last):
+    """Último valor corregido con el modelo lineal de humedad (nunca negativo)."""
+    if not model or pm_last is None or rh_last is None:
+        return None
+    co = model["coef"]
+    v = co["a_pm"] * pm_last + co["b_rh"] * rh_last + co["c"]
+    return round(max(0.0, v), 2)
+
+
+def apply_malm_correction(pm_val, rh_pct):
+    """
+    P1.2: Corrección de PM por humedad con la fórmula EPA/Malm & Hand,
+    usada por la red PurpleAir y recomendada por EPA para sensores ópticos.
+    La relación es superlineal cerca del punto de delicuescencia (~80% HR),
+    especialmente relevante en climas húmedos como el Cantábrico.
+    PM_corr = PM / (1 + k * HR/(100-HR))
+    k=0.24 para HR < 80%,  k=0.52 para HR >= 80%
+    """
+    if pm_val is None or rh_pct is None or rh_pct >= 100:
+        return None
+    k = 0.52 if rh_pct >= 80 else 0.24
+    denom = 1.0 + k * rh_pct / (100.0 - rh_pct)
+    return round(max(0.0, pm_val / denom), 2)
+
+
+# ── Mejora 1: validación cruzada entre sensores (consenso de vecinos) ───────
+# Cada sensor se coteja contra la MEDIANA de los demás sensores de su zona.
+# Detecta averías sin referencia externa y valida métricas que ninguna
+# referencia cubre (ruido, CO2). Una sola consulta InfluxDB (GROUP BY mac).
+def fetch_series_by_sensor(geo3, hours):
+    """{ mac: { metric: {hora_epoch: valor} } }, con rango físico aplicado."""
+    sel = ", ".join(f'mean("{m}") AS "{m}"' for m in METRICS)
+    q = (f'SELECT {sel} FROM "{MEASUREMENT}" '
+         f"WHERE \"geo3\" = '{geo3}' AND time > now() - {hours}h "
+         f'GROUP BY time(1h), "mac" fill(none)')
+    c = influx_client()
+    out = {}
+    try:
+        res = c.query(q, epoch="s")
+        for (meas, tags), pts in res.items():
+            mac = (tags or {}).get("mac")
+            if not mac:
+                continue
+            d = out.setdefault(mac, {})
+            for p in pts:
+                t = int(p["time"])
+                for m in METRICS:
+                    v = p.get(m)
+                    if v is None:
+                        continue
+                    rng = METRICS[m].get("range")
+                    if rng and not (rng[0] <= v <= rng[1]):
+                        continue
+                    d.setdefault(m, {})[t] = float(v)
+    finally:
+        c.close()
+    return out
+
+
+CROSS_MIN_SENSORS = int(os.getenv("CROSS_MIN_SENSORS", "3"))
+CROSS_MIN_N = int(os.getenv("CROSS_MIN_N", "12"))
+
+def cross_sensor_validation(geo3, hours):
+    """
+    Para cada métrica medida por >= CROSS_MIN_SENSORS sensores, coteja cada
+    sensor contra la mediana de los DEMÁS (consenso), hora a hora.
+    Etiquetas: coherente / dudoso / divergente / sin_pares.
+    """
+    data = fetch_series_by_sensor(geo3, hours)
+    if len(data) < CROSS_MIN_SENSORS:
+        return None
+    names = _sensor_names()
+    # métricas con suficientes sensores y varianza real
+    metric_sensors = {}
+    for mac, mm in data.items():
+        for m, pts in mm.items():
+            if len(pts) >= CROSS_MIN_N and np.std(list(pts.values())) > 1e-9:
+                metric_sensors.setdefault(m, []).append(mac)
+    evaluated = [m for m, macs in metric_sensors.items()
+                 if len(macs) >= CROSS_MIN_SENSORS]
+    if not evaluated:
+        return None
+    sensors_out = {}
+    notes = []
+    for m in evaluated:
+        macs = metric_sensors[m]
+        for mac in macs:
+            mine = data[mac][m]
+            pairs = []
+            for h, v in mine.items():
+                others = [data[o][m][h] for o in macs
+                          if o != mac and h in data[o][m]]
+                if len(others) >= 2:      # consenso necesita >=2 vecinos
+                    pairs.append((v, float(np.median(others))))
+            if len(pairs) < CROSS_MIN_N:
+                label, det = "sin_pares", {"n": len(pairs)}
+            else:
+                sv = np.array([p[0] for p in pairs])
+                cv = np.array([p[1] for p in pairs])
+                rho, _p = sps.spearmanr(sv, cv)
+                rho = float(rho) if rho == rho else 0.0
+                cm = float(np.mean(cv))
+                bias_pct = (round(100.0 * float(np.mean(sv - cv)) / cm, 1)
+                            if cm > 0 else None)
+                if rho >= 0.5 and (bias_pct is None or abs(bias_pct) <= 150):
+                    label = "coherente"
+                elif rho < 0.2 or (bias_pct is not None and abs(bias_pct) > 300):
+                    label = "divergente"
+                else:
+                    label = "dudoso"
+                det = {"rho_consenso": round(rho, 2), "bias_pct": bias_pct,
+                       "n": len(pairs)}
+            s = sensors_out.setdefault(mac, {"name": names.get(mac, mac[-6:]),
+                                             "labels": {}, "detail": {}})
+            s["labels"][m] = label
+            s["detail"][m] = det
+            if label == "divergente":
+                lbl = METRICS.get(m, {}).get("label", m)
+                notes.append(f"{s['name']}: {lbl} divergente del consenso "
+                             f"local (rho={det.get('rho_consenso')}, "
+                             f"sesgo {det.get('bias_pct')}%)")
+    return {"metrics_evaluated": evaluated, "min_sensors": CROSS_MIN_SENSORS,
+            "sensors": sensors_out, "notes": notes or None,
+            "excluded": _cross_excluded(data, sensors_out, names) or None}
+
+
+def _cross_excluded(data, sensors_out, names):
+    """Sensores presentes pero no evaluables, con el motivo (diagnóstico)."""
+    out = {}
+    for mac, mm in data.items():
+        if mac in sensors_out:
+            continue
+        has_signal = any(
+            len(p) >= CROSS_MIN_N and np.std(list(p.values())) > 1e-9
+            for p in mm.values())
+        if not has_signal:
+            reason = ("sin variacion o sin datos validos en la ventana "
+                      "(valores constantes/fuera de rango: posible averia)")
+        else:
+            reason = "sus metricas no las comparten >=3 sensores"
+        out[mac] = {"name": names.get(mac, mac[-6:]), "reason": reason}
+    return out
+
+
+# ── Mejora 3: rosa de contaminación (concentración según dirección viento) ──
+import calendar as _calendar
+_wind_cache = {}
+ROSE_SECTORS = ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]
+ROSE_CALM_KMH = float(os.getenv("ROSE_CALM_KMH", "5"))
+
+def fetch_wind_series(geo3, hours):
+    """
+    P1.1: Viento horario pasado usando la Historical Forecast API de Open-Meteo
+    (inicializada con observaciones reales, más precisa que el pronóstico simple).
+    También recoge precipitación y presión para correlación PM (P2.5).
+    Devuelve {hora_epoch: (vel_kmh, dir_deg, precip_mm, pres_hpa)}.
+    """
+    key = (geo3, int(hours))
+    now_t = time.time()
+    hit = _wind_cache.get(key)
+    if hit and now_t - hit[0] < WEATHER_CACHE_TTL:
+        return hit[1]
+    lat, lon = geohash_center(geo3)
+    past_days = min(7, max(2, int(hours / 24) + 1))
+    params = {
+        "latitude": round(lat, 4), "longitude": round(lon, 4),
+        "hourly": "wind_speed_10m,wind_direction_10m,precipitation,surface_pressure",
+        "past_days": past_days, "forecast_days": 1,
+        "wind_speed_unit": "kmh", "timezone": "UTC"
+    }
+    # P1.1: Historical Forecast API (datos casi idénticos a observaciones reales)
+    r = requests.get(OPEN_METEO_HIST_URL, params=params, timeout=30)
+    r.raise_for_status()
+    hly = r.json().get("hourly", {})
+    out = {}
+    for s, spd, deg, prec, pres in zip(
+            hly.get("time", []),
+            hly.get("wind_speed_10m", []),
+            hly.get("wind_direction_10m", []),
+            hly.get("precipitation", []) or [None] * 9999,
+            hly.get("surface_pressure", []) or [None] * 9999):
+        if spd is None or deg is None:
+            continue
+        try:
+            ep = _calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M"))
+        except ValueError:
+            continue
+        out[ep] = (float(spd), float(deg),
+                   float(prec) if prec is not None else None,
+                   float(pres) if pres is not None else None)
+    _wind_cache[key] = (now_t, out)
+    return out
+
+
+def pollution_rose(geo3, hours, series_clean, metrics=("pm25", "pm10")):
+    """
+    Media de concentración por sector de viento (8 sectores + calma).
+    Señala de dónde viene la contaminación. Solo métricas con confianza
+    razonable (PM); los gases no fiables no se incluyen.
+    """
+    try:
+        wind = fetch_wind_series(geo3, hours)
+    except requests.RequestException as e:
+        log.warning("viento histórico no disponible para %s: %s", geo3, e)
+        return None
+    if not wind:
+        return None
+    rose = {}
+    note = None
+    for m in metrics:
+        if m not in series_clean:
+            continue
+        t, v = series_clean[m]
+        acc, calm = {}, []
+        for ti, vi in zip(t, v):
+            h = int(ti // 3600) * 3600
+            w = wind.get(h)
+            if not w:
+                continue
+            spd, deg = w[0], w[1]   # (vel, dir, precip, pres) -> solo vel+dir
+            if spd < ROSE_CALM_KMH:
+                calm.append(float(vi))
+                continue
+            sector = ROSE_SECTORS[int((deg + 22.5) // 45) % 8]
+            acc.setdefault(sector, []).append(float(vi))
+        entry = {s: {"mean": round(float(np.mean(vals)), 1), "n": len(vals)}
+                 for s, vals in acc.items()}
+        if calm:
+            entry["calma"] = {"mean": round(float(np.mean(calm)), 1),
+                              "n": len(calm)}
+        if entry:
+            rose[m] = entry
+    if not rose:
+        return None
+    # nota interpretativa sobre PM2.5 (la métrica fiable)
+    pm = rose.get("pm25") or rose.get("pm10")
+    if pm:
+        sectors = {s: d for s, d in pm.items() if s != "calma" and d["n"] >= 3}
+        if len(sectors) >= 2:
+            allv = [d["mean"] for d in sectors.values()]
+            top = max(sectors.items(), key=lambda kv: kv[1]["mean"])
+            overall = float(np.mean(allv))
+            # exige ratio 1.5x Y diferencia absoluta relevante (>=2 µg/m³),
+            # para no generar notas absurdas con concentraciones ínfimas
+            if (overall > 0 and top[1]["mean"] >= 1.5 * overall
+                    and top[1]["mean"] - overall >= 2.0):
+                mkey = "pm25" if "pm25" in rose else "pm10"
+                lbl = METRICS.get(mkey, {}).get("label", mkey)
+                note = (f"{lbl} notablemente más alto con viento del "
+                        f"{top[0]} ({top[1]['mean']} de media en "
+                        f"{top[1]['n']} h, frente a {round(overall,1)} "
+                        f"del conjunto): posible fuente en esa dirección.")
+    return {"sectors": rose, "calm_threshold_kmh": ROSE_CALM_KMH,
+            "note": note}
+
+
+# ── Conversión de gases ppm -> µg/m³ (o mg/m³) ──────────────────────────────
+def _zone_t_p(raw):
+    """Media de T (°C) y P (hPa) medidas por la zona; estandar si faltan."""
+    t_c = float(np.mean(raw["tmp"][1])) if "tmp" in raw and len(raw["tmp"][1]) else 25.0
+    p_hpa = float(np.mean(raw["prs"][1])) if "prs" in raw and len(raw["prs"][1]) else 1013.25
+    # sanea valores absurdos
+    if not (-40 <= t_c <= 60): t_c = 25.0
+    if not (800 <= p_hpa <= 1100): p_hpa = 1013.25
+    return t_c, p_hpa
+
+def convert_gases(raw):
+    """
+    Convierte in-place las series de gases de ppm a µg/m³ (CO a mg/m³):
+      conc = ppm * factor * M / Vm,  con Vm = 22.414 * (T/273.15K) * (1013.25/P)
+    Usa la T y P medias medidas por la propia zona (rigor: corrige por
+    condiciones reales, no estandar). Devuelve dict con los factores usados.
+    """
+    t_c, p_hpa = _zone_t_p(raw)
+    vm = 22.414 * ((t_c + 273.15) / 273.15) * (1013.25 / p_hpa)  # L/mol
+    applied = {"t_c": round(t_c, 1), "p_hpa": round(p_hpa, 1),
+               "molar_volume_l": round(vm, 3), "factors": {}}
+    for gas, info in GAS_CONVERSION.items():
+        if gas in raw:
+            f = info["factor"] * info["molar_mass"] / vm
+            t, v = raw[gas]
+            raw[gas] = (t, v * f)
+            applied["factors"][gas] = {"ppm_to": info["to"],
+                                       "multiplier": round(f, 3)}
+    return applied
+
+# ── Análisis de zona (estadística + clima) ──────────────────────────────────
+# ── P2.2: Índice europeo CAQI ─────────────────────────────────────────────────
+# Common Air Quality Index (UE): usa medias de 24h de PM2.5 y PM10.
+# Umbrales en µg/m³ (PM2.5): muy bajo <10, bajo 10-20, medio 20-25,
+# alto 25-50, muy alto >50.  (PM10: ×2 aprox.)
+CAQI_LEVELS = [
+    (0,  10,  "muy bajo",  "#79BC6A"),
+    (10, 20,  "bajo",      "#BBCF4C"),
+    (20, 25,  "medio",     "#EEC20B"),
+    (25, 50,  "alto",      "#F29305"),
+    (50, 800, "muy alto",  "#E8416F"),
+]
+
+def _caqi_label(val_pm25):
+    for lo, hi, label, color in CAQI_LEVELS:
+        if lo <= val_pm25 < hi:
+            return {"value": round(val_pm25, 1), "label": label, "color": color}
+    return {"value": round(val_pm25, 1), "label": "muy alto", "color": "#E8416F"}
+
+def compute_caqi(stats_by_metric):
+    """P2.2: CAQI basado en la media de 24h de PM2.5 (y PM10 como referencia)."""
+    pm25 = (stats_by_metric.get("pm25") or {}).get("mean")
+    pm10 = (stats_by_metric.get("pm10") or {}).get("mean")
+    if pm25 is None:
+        return None
+    out = {"pm25": _caqi_label(pm25)}
+    if pm10 is not None:
+        out["pm10"] = _caqi_label(pm10 / 2.0)  # normaliza al índice de PM2.5
+    return out
+
+
+# ── P2.3: Detección de episodios sostenidos ─────────────────────────────────
+EPISODE_MIN_HOURS = int(os.getenv("EPISODE_MIN_HOURS", "2"))  # min duración
+# Métricas que pueden formar un "episodio". Solo contaminantes y ruido: la
+# humedad tiene umbral 80% y en Bilbao eso es un día normal, así que salían
+# "episodios sostenidos de humedad" que no dicen nada de la calidad del aire.
+# La temperatura queda fuera por el mismo motivo (es contexto, no episodio).
+EPISODE_METRICS = set(m.strip() for m in os.getenv(
+    "EPISODE_METRICS", "pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db").split(",")
+    if m.strip())
+
+def detect_episodes(series_clean, confidence=None):
+    """
+    P2.3: Detecta períodos sostenidos de alta concentración.
+    Excluye métricas marcadas como no_fiable (misma lógica que las alertas).
+    """
+    confidence = confidence or {}
+    episodes = []
+    for m, (t, v) in series_clean.items():
+        if m not in EPISODE_METRICS:
+            continue
         if confidence.get(m, {}).get("label") == "no_fiable":
             continue
         th = THRESHOLDS.get(m)
@@ -1265,8 +3073,17 @@ def env_correlations(series_clean, wind_data):
 
 
 # ── P1.4: guardar factor PM en histórico semanalmente ─────────────────────────
-def _save_pm_factor_history(geo3, pm_corrections_data):
-    """P1.4: guarda el factor de corrección PM semanal en análisis BD."""
+def _save_pm_factor_history(geo3, pm_corrections_data, basis="desconocida"):
+    """
+    P1.4: guarda el factor de corrección PM en la BD de análisis.
+
+    'basis' dice CONTRA QUÉ se calculó el factor, y es imprescindible: esta
+    función se llama DOS veces por ciclo, una con el factor derivado de CAMS y
+    otra con el derivado de la cabina oficial, con los mismos tags. Sin
+    distinguirlas, la mediana diaria mezclaba las dos bases —para pm25 de la
+    zona ezt, ~0,664 de CAMS con ~1,233 de la cabina— y el resultado no
+    significaba nada: ni el valor ni su variabilidad.
+    """
     if not pm_corrections_data:
         return
     try:
@@ -1281,7 +3098,7 @@ def _save_pm_factor_history(geo3, pm_corrections_data):
             fields["geo3_tag"] = geo3
             c.write_points([{
                 "measurement": "pm_factor_history",
-                "tags": {"geo3": geo3},
+                "tags": {"geo3": geo3, "basis": basis or "desconocida"},
                 "fields": fields,
             }])
         c.close()
@@ -1290,7 +3107,8 @@ def _save_pm_factor_history(geo3, pm_corrections_data):
 
 
 def zone_statistics(geo3, hours, mac=None):
-    raw = fetch_zone_series(geo3, hours, mac=mac)
+    agg_info = {}
+    raw = fetch_zone_series(geo3, hours, mac=mac, info=agg_info)
     if not raw:
         return None
     conversion = convert_gases(raw)  # ppm -> µg/m³ (CO -> mg/m³) con T,P reales
@@ -1298,9 +3116,57 @@ def zone_statistics(geo3, hours, mac=None):
     cleaning = {}
     stats_by_metric = {}
     skipped = []
+    discarded = {}
+    # ESOD-WH: repositorio histórico (fH) de esta zona/sensor. Una sola lectura
+    # por ciclo, cacheada; si está vacío el rescate se apoya solo en la racha.
+    hist = _esod_hist_load(geo3, mac)
     for m, (t, v) in raw.items():
-        tc, vc, info = clean_series(t, v, m)
+        # el histórico se alimenta con lo que pasa el rango físico, antes del
+        # MAD, para que contenga los episodios reales y no solo lo que el
+        # filtro dejó pasar
+        try:
+            lo_m, hi_m = METRICS[m]["range"]
+            ok_m = (v >= lo_m) & (v <= hi_m)
+            _esod_hist_save(geo3, mac, m, t[ok_m], v[ok_m])
+        except Exception as e:
+            log.debug("esod: histórico %s/%s no grabado: %s", geo3, m, e)
+        tc, vc, info = clean_series(t, v, m, hist=hist)
         if len(vc) < 6:
+            # Antes esto era un 'continue' mudo y la métrica se esfumaba sin
+            # explicación. Caso real: el nodo de gases leía NH3 ~1518 µg/m³, el
+            # filtro de rango (0-400) tiraba TODOS los puntos y el NH3
+            # desaparecía del análisis sin que nada lo dijera.
+            lo, hi = METRICS[m]["range"]
+            n_raw = int(len(v))
+            por_rango = info.get("dropped_range", 0)
+            det = {
+                "raw_points": n_raw,
+                "kept": int(len(vc)),
+                "dropped_range": por_rango,
+                "dropped_outlier": info.get("dropped_outlier", 0),
+                "valid_range": [lo, hi],
+            }
+            if n_raw:
+                med = float(np.median(v))
+                det["raw_median"] = round(med, 2)
+                det["raw_min"] = round(float(np.min(v)), 2)
+                det["raw_max"] = round(float(np.max(v)), 2)
+                if por_rango >= max(1, int(n_raw * 0.9)):
+                    det["reason"] = "fuera_de_rango_fisico"
+                    lado = "por encima" if med > hi else "por debajo"
+                    det["note"] = (
+                        f"el sensor lee ~{med:g} {METRICS[m]['label']}, {lado} "
+                        f"del rango físico {lo}-{hi}: se descarta todo. "
+                        f"Revisa calibración o conversión de unidades.")
+                else:
+                    det["reason"] = "pocos_datos_tras_limpieza"
+                    det["note"] = (
+                        f"solo {len(vc)} puntos válidos de {n_raw}: hacen falta "
+                        f"6 para analizar.")
+            else:
+                det["reason"] = "sin_datos"
+            discarded[m] = det
+            log.info("zona %s: %s descartada (%s)", geo3, m, det.get("reason"))
             continue
         # descarta metricas sin senal real: varianza nula = sensor no mide
         if float(np.std(vc)) < 1e-9:
@@ -1320,6 +3186,10 @@ def zone_statistics(geo3, hours, mac=None):
         "correlations": correlations(series_clean),
         "cleaning": cleaning,
         "skipped_no_signal": skipped,
+        # métricas que no llegaron al análisis, con el motivo
+        "discarded_metrics": discarded,
+        # cómo se combinaron los sensores y a quién se excluyó por leer 0
+        "aggregation": agg_info,
     }
     # P2.2: Índice europeo CAQI (basado en medias de 24h de PM2.5/PM10) ──────
     result["caqi"] = compute_caqi(stats_by_metric)
@@ -1350,35 +3220,76 @@ def zone_statistics(geo3, hours, mac=None):
                 corr = pm_corrections(comp)
                 if corr:
                     for m, info in corr.items():
+                        info["source"] = "cams"
                         if m in stats_by_metric:
                             lv = stats_by_metric[m]["last_value"]
                             info["corrected_last"] = round(lv * info["factor"], 2)
                             info["raw_last"] = lv
                     result["pm_corrections"] = corr
-                    _save_pm_factor_history(geo3, corr)   # P1.4
+                    _save_pm_factor_history(geo3, corr, basis="cams")   # P1.4
         except Exception as e:
             log.warning("comparacion CAMS no disponible para %s: %s", geo3, e)
-    # comparación con estaciones OFICIALES locales (Euskadi) como 2ª referencia.
-    # Combina varias estaciones (p.ej. Barakaldo + Zorroza) para cubrir más
-    # métricas (NH3 y O3 los aporta la unidad móvil de Zorroza).
-    if euskadi.EUSKADI_ENABLED and geo3 in ZONE_HAS_OFFICIAL:
+    # comparación con estaciones OFICIALES como 2ª referencia. Cadena:
+    #   red local (Euskadi, elegida por cercanía y cobertura de métricas)
+    #   -> OpenAQ (redes oficiales del resto del mundo)
+    # Ya no hace falta una lista de zonas: cada fuente decide si cubre la
+    # posición real de los sensores. ZONE_HAS_OFFICIAL, si se rellena, solo
+    # limita en qué zonas se gasta red.
+    if not ZONE_HAS_OFFICIAL or geo3 in ZONE_HAS_OFFICIAL:
         try:
-            off, off_src = euskadi.fetch_official_series(hours)
+            # T y P reales de la zona: OpenAQ puede devolver gases en ppm/ppb y
+            # la conversión a µg/m³ depende del volumen molar.
+            t_c = (stats_by_metric.get("tmp") or {}).get("last_value")
+            p_hpa = (stats_by_metric.get("prs") or {}).get("last_value")
+            off, off_src, off_meta = fetch_official_any(
+                geo3, hours, t_c=t_c, p_hpa=p_hpa, mac=mac)
+            result["official_meta"] = off_meta
             if off:
+                # guarda la serie horaria de cabina: es el material del que
+                # TPB-D construye su subespacio, y hasta ahora se tiraba
+                try:
+                    _ref_hist_save(geo3, off_meta.get("provider"), off)
+                except Exception as e:
+                    log.debug("ref_history no grabado para %s: %s", geo3, e)
                 off_comp = compare_with_reference(series_clean, off)
                 if off_comp:
                     off_ref = off
-                    result["official_stations"] = euskadi.EUSKADI_STATIONS
+                    prov = off_meta.get("provider") or "oficial"
+                    result["official_provider"] = prov
+                    result["official_stations"] = [
+                        s.get("name") for s in off_meta.get("stations") or []]
                     result["official_sources"] = off_src
                     result["official_comparison"] = off_comp
                     result["official_notes"] = interpret_comparison(
-                        off_comp, reference="estaciones oficiales")
+                        off_comp, reference=(
+                            "estaciones oficiales (red vasca)"
+                            if prov == "euskadi"
+                            else "estaciones oficiales (OpenAQ)"))
                     off_conf = build_confidence(off_comp)
                     result["official_confidence"] = off_conf
                     # confianza final = la MEJOR correlación entre CAMS y oficial,
                     # por métrica (no se penaliza por picos locales no captados)
-                    confidence = merge_confidence(confidence, off_conf)
+                    confidence = merge_confidence(confidence, off_conf,
+                                                  official_source=prov)
                     result["confidence"] = confidence
+                    # El factor de correccion de PM se rehace contra la cabina
+                    # oficial: es aire real del mismo sitio, no un modelo de
+                    # 11 km. Con CAMS salia 0,664 para PM2.5 (empeoraba la
+                    # lectura); contra la cabina sale ~1,23.
+                    corr_off = pm_corrections(
+                        off_comp, basis=f"estaciones oficiales ({prov})")
+                    if corr_off:
+                        dest = result.setdefault("pm_corrections", {})
+                        for m, info in corr_off.items():
+                            entry = dest.setdefault(m, {})
+                            info["source"] = prov
+                            entry.update(info)
+                            lv = (stats_by_metric.get(m) or {}).get("last_value")
+                            if lv is not None:
+                                entry["corrected_last"] = round(
+                                    lv * info["factor"], 2)
+                                entry["raw_last"] = lv
+                        _save_pm_factor_history(geo3, corr_off, basis=prov)
         except Exception as e:
             log.warning("comparacion oficial no disponible para %s: %s", geo3, e)
     # P1.2: corrección de PM por humedad — modelo lineal + fórmula Malm/EPA
@@ -1408,11 +3319,81 @@ def zone_statistics(geo3, hours, mac=None):
                 entry["rh_model"] = model
     except Exception as e:
         log.warning("modelo de humedad no disponible para %s: %s", geo3, e)
-    # recalcula alertas descartando metricas marcadas como no fiables
-    result["alerts"] = detect_alerts(stats_by_metric, confidence)
+
+    # ── Jerarquía de corrección de PM: una sola cifra aplicada ───────────
+    # Antes se publicaban dos correcciones contradictorias a la vez. Medido en
+    # ezt: el factor contra cabina daba x1,233 (5,47 -> 6,74) y Malm daba
+    # 5,47 -> 3,47, es decir uno multiplicando por 1,23 y el otro dividiendo
+    # por 1,58. La web mostraba las dos sin decir cuál creer.
+    #
+    #   1. factor contra cabina oficial  -> es la que se aplica
+    #   2. fórmula Malm/EPA por humedad  -> solo si NO hay cabina
+    #   3. factor contra CAMS            -> informativo, nunca se aplica
+    #
+    # Por qué CAMS no se aplica: es un modelo de 11 km y su media puede estar
+    # sesgada. Medido aquí: daba factor 0,664 para un sensor que YA subestima
+    # un 19% frente a la cabina, o sea empeoraba la lectura.
+    #
+    # Por qué Malm cede ante la cabina: la fórmula asume que el óptico
+    # SOBREESTIMA con humedad alta (las partículas absorben agua). Contra la
+    # cabina estos sensores SUBESTIMAN, así que la hipótesis de la fórmula ya
+    # está desmentida por los datos. Se conserva como información: que el signo
+    # no cuadre dice que la humedad no explica el sesgo de estos equipos.
+    for m, entry in (result.get("pm_corrections") or {}).items():
+        raw = (stats_by_metric.get(m) or {}).get("last_value")
+        src = entry.get("source")
+        factor = entry.get("factor")
+        malm = entry.get("malm_corrected_last")
+        entry["raw_last"] = entry.get("raw_last", raw)
+        if factor is not None and src and src != "cams":
+            entry["applied"] = "factor_referencia"
+            entry["applied_factor"] = factor
+            entry["applied_value"] = entry.get("corrected_last")
+            entry["applied_source"] = src
+            entry["applied_note"] = f"factor x{factor} contra cabina oficial ({src})"
+        elif malm is not None:
+            entry["applied"] = "malm_humedad"
+            entry["applied_factor"] = None
+            entry["applied_value"] = malm
+            entry["applied_source"] = "formula EPA/Malm"
+            entry["applied_note"] = (
+                f"sin cabina oficial cerca: {entry.get('malm_note','formula EPA')}")
+        else:
+            entry["applied"] = None
+            entry["applied_value"] = None
+            entry["applied_note"] = "sin correccion disponible"
+        # ¿coincide Malm en el sentido con lo que dice la cabina?
+        if malm is not None and raw:
+            entry["malm_applied"] = (entry["applied"] == "malm_humedad")
+            if factor is not None and src and src != "cams":
+                sube_ref = factor > 1.0
+                sube_malm = malm > raw
+                entry["malm_consistent"] = (sube_ref == sube_malm)
+                if not entry["malm_consistent"]:
+                    entry["malm_conflict_note"] = (
+                        "la formula de humedad apunta al lado contrario que la "
+                        "cabina: la humedad no explica el sesgo de este sensor")
+    # recalcula alertas descartando metricas marcadas como no fiables.
+    # series_recent y prev_alerts NO se pasaban, asi que la persistencia y la
+    # histeresis de P1.3 eran codigo muerto: el 'if series_recent and ...' nunca
+    # entraba y prev_set salia siempre vacio. Ahora si.
+    _clave_al = f"{geo3}|{mac or ''}"
+    result["alerts"] = detect_alerts(
+        stats_by_metric, confidence,
+        prev_alerts=_last_alerts.get(_clave_al),
+        series_recent=series_clean)
+    _last_alerts[_clave_al] = result["alerts"]
     # P2.3: episodios sostenidos — excluye métricas no_fiable (misma lógica
     # que las alertas, confidence ya calculada aquí)
     result["episodes"] = detect_episodes(series_clean, confidence)
+    # W-UDDR: deriva del factor de correccion sobre el historial diario
+    if mac is None:
+        try:
+            dr = detect_factor_drift(geo3)
+            if dr:
+                result["factor_drift"] = dr
+        except Exception as e:
+            log.debug("deriva de factor no disponible para %s: %s", geo3, e)
     # Mejoras 1 y 3 (solo a nivel de ZONA, no por sensor individual)
     if mac is None:
         try:
@@ -1620,6 +3601,13 @@ def store_analysis(result):
             rhm = info.get("rh_model") or {}
             if rhm.get("corrected_last") is not None:
                 fields[f"{m}_corr_rh"] = float(rhm["corrected_last"])
+        # qué referencia oficial respondió: euskadi | openaq | (ninguna -> cams)
+        prov = result.get("official_provider")
+        if prov:
+            fields["ref_source"] = str(prov)
+            sts = result.get("official_stations") or []
+            if sts:
+                fields["ref_stations"] = ", ".join(str(s) for s in sts if s)[:300]
         w = (result.get("weather") or {}).get("now") or {}
         if w.get("wind_kmh") is not None:
             fields["wind_kmh"] = float(w["wind_kmh"])
@@ -1672,9 +3660,9 @@ def telegram_send(text):
 
 _last_status = {}  # geo3 -> status anterior (aviso solo en transiciones)
 
-# URL pública de la web (para enlazar en los mensajes)
-WEB_URL = os.getenv("WEB_URL",
-                    "https://barakaldo-makers.github.io/CanAirIO-analysis/")
+# URL pública de la web, para enlazarla en los mensajes de Telegram.
+# Vacía por defecto: cada despliegue pone la suya en WEB_URL.
+WEB_URL = os.getenv("WEB_URL", "").strip()
 
 _CONF_ICON = {"fiable": "\u2705", "dudoso": "\u26A0\uFE0F",
               "no_fiable": "\u274C", "sin_referencia": "\u2753"}
@@ -1775,7 +3763,8 @@ def maybe_alert_critical(result):
             lines.append("\n<b>Recomendaciones:</b>")
             for r in recs[:3]:
                 lines.append(f"  \u2022 {r}")
-        lines.append(f"\n<a href=\"{WEB_URL}\">Ver detalle en la web</a>")
+        if WEB_URL:
+            lines.append(f"\n<a href=\"{WEB_URL}\">Ver detalle en la web</a>")
         telegram_send("\n".join(lines))
 
     elif prev == "critical" and st != "critical":
@@ -1904,7 +3893,8 @@ def daily_summary():
         except Exception as e:
             log.debug("salud de red no disponible: %s", e)
 
-        lines.append(f"\n<a href=\"{WEB_URL}\">Ver an\u00e1lisis completo</a>")
+        if WEB_URL:
+            lines.append(f"\n<a href=\"{WEB_URL}\">Ver an\u00e1lisis completo</a>")
         telegram_send("\n".join(lines))
         log.info("[Telegram] resumen diario enviado")
     except Exception as e:
@@ -1943,10 +3933,16 @@ def collect_sensors():
         # agrupamos por los tags que identifican una estación física.
         # 'name' NO es tag (va como field), así que lo traemos con last().
         # Traemos también gases (ppm) y ruido (dB) para la tabla.
+        # Además del último valor pedimos la media de la ventana: un nodo que
+        # no lleva ese sensor publica 0 en TODAS sus lecturas, y 0 está dentro
+        # del rango físico de pm*, no2, o3, nh3, co y db, así que pasaba como
+        # dato bueno y la tabla mostraba ceros falsos. media == 0 => no lo mide.
+        _tabla = ("pm25", "pm10", "no2", "o3", "nh3", "co", "db")
+        medias = ", ".join(f'mean("{m}") AS "{m}__m"' for m in _tabla)
         q = (f'SELECT last("pm25") AS pm25, last("pm10") AS pm10, '
              f'last("no2") AS no2, last("o3") AS o3, last("nh3") AS nh3, '
              f'last("co") AS co, last("db") AS db, '
-             f'last("geo") AS geo, last("name_1") AS sname '
+             f'last("geo") AS geo, last("name_1") AS sname, {medias} '
              f'FROM "{MEASUREMENT}" '
              f'WHERE time > now() - {SENSORS_ACTIVE_HOURS}h '
              f'GROUP BY "mac", "geo3"')
@@ -1989,10 +3985,19 @@ def collect_sensors():
             if rng and not (rng[0] <= val <= rng[1]):
                 return None
             return val
-        def ranged(metric, val):
-            """Devuelve (valor, fuera_de_rango). Marca en vez de descartar."""
+        def ranged(metric, val, punto=None):
+            """
+            Devuelve (valor, fuera_de_rango). Marca en vez de descartar.
+            Si la media de la ventana es exactamente 0, el nodo no lleva ese
+            sensor: devuelve None para que la tabla lo deje en blanco en vez
+            de mostrar un 0 que parece una medida.
+            """
             if val is None:
                 return None, False
+            if ZERO_MEANS_ABSENT and punto is not None:
+                media = punto.get(f"{metric}__m")
+                if media is not None and media == 0:
+                    return None, False
             rng = METRICS.get(metric, {}).get("range")
             out = bool(rng and not (rng[0] <= val <= rng[1]))
             return val, out
@@ -2012,13 +4017,13 @@ def collect_sensors():
                     lat, lon = geohash_center(tags["geo3"])
                 except Exception:
                     lat = lon = None
-            pm25, pm25o = ranged("pm25", _r(p.get("pm25")))
-            pm10, pm10o = ranged("pm10", _r(p.get("pm10")))
-            no2, no2o   = ranged("no2", gas_ug(p.get("no2"), 46.01))
-            o3, o3o     = ranged("o3", gas_ug(p.get("o3"), 48.00))
-            nh3, nh3o   = ranged("nh3", gas_ug(p.get("nh3"), 17.03))
-            co, coo     = ranged("co", _r(p.get("co")))  # ya viene en mg/m³
-            db, dbo     = ranged("db", _r(p.get("db")))
+            pm25, pm25o = ranged("pm25", _r(p.get("pm25")), p)
+            pm10, pm10o = ranged("pm10", _r(p.get("pm10")), p)
+            no2, no2o   = ranged("no2", gas_ug(p.get("no2"), 46.01), p)
+            o3, o3o     = ranged("o3", gas_ug(p.get("o3"), 48.00), p)
+            nh3, nh3o   = ranged("nh3", gas_ug(p.get("nh3"), 17.03), p)
+            co, coo     = ranged("co", _r(p.get("co")), p)  # ya viene en mg/m³
+            db, dbo     = ranged("db", _r(p.get("db")), p)
             rows.append({
                 "name": p.get("sname") or (tags.get("mac") or "")[:8],
                 "mac": tags.get("mac"),
@@ -2058,7 +4063,8 @@ def publish_site():
             f'last("vis_km") AS vis_km, last("uv") AS uv, last("snow_12h") AS snow_12h, '
             f'last("pm25_conf") AS pm25c, '
             f'last("pm10_conf") AS pm10c, last("no2_conf") AS no2c, '
-            f'last("o3_conf") AS o3c, last("pm25_corr_factor") AS pm25f '
+            f'last("o3_conf") AS o3c, last("pm25_corr_factor") AS pm25f, '
+            f'last("ref_source") AS refsrc, last("ref_stations") AS refsts '
             f'FROM "{ANALYSIS_MEAS}" '
             f'WHERE time > now() - 6h GROUP BY "geo3"')
         st_name = {0: "ok", 1: "warning", 2: "critical"}
@@ -2094,6 +4100,9 @@ def publish_site():
                 "confidence": {"pm25": cf("pm25c"), "pm10": cf("pm10c"),
                                "no2": cf("no2c"), "o3": cf("o3c")},
                 "pm25_corr_factor": p.get("pm25f"),
+                # referencia usada para validar: euskadi | openaq | cams
+                "ref_source": p.get("refsrc") or "cams",
+                "ref_stations": p.get("refsts") or "",
             })
         # histórico para timeline/gráficas: series por hora por zona
         hist = c.query(
@@ -2146,6 +4155,9 @@ def publish_site():
                     "prediction": r.get("prediction_6h", ""),
                     "data_quality_note": r.get("data_quality_note"),
                     "pm_corrections": r.get("pm_corrections"),
+                    # métricas que el sensor envía pero no se pueden analizar
+                    # (ej. NH3 leyendo 1520 µg/m³, fuera del rango 0-400)
+                    "discarded_metrics": r.get("discarded_metrics"),
                     "points": s["points"],
                 })
             z["sensors"] = sens_list
@@ -2178,7 +4190,10 @@ def publish_site():
         # listado completo de sensores CanAirIO activos
         try:
             sensors = collect_sensors()
-            publisher.export_sensors(sensors)
+            publisher.export_sensors(
+                sensors,
+                ranges={m: list(i["range"]) for m, i in METRICS.items()
+                        if i.get("range")})
         except Exception as e:
             log.warning("no pude exportar sensors.json: %s", e)
         publisher.git_publish()
@@ -2242,6 +4257,12 @@ def analyze_zone_full(geo3, hours, mac=None, skip_weather=False):
     result["official_sources"] = zs.get("official_sources")
     result["official_comparison"] = zs.get("official_comparison")
     result["official_notes"] = zs.get("official_notes")
+    result["official_provider"] = zs.get("official_provider")
+    result["official_meta"] = zs.get("official_meta")
+    result["aggregation"] = zs.get("aggregation")
+    result["cleaning"] = zs.get("cleaning")
+    result["skipped_no_signal"] = zs.get("skipped_no_signal")
+    result["discarded_metrics"] = zs.get("discarded_metrics")
     result["weather"] = weather
     return result
 
@@ -2369,23 +4390,235 @@ def sensors_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _primera_zona_activa():
+    """
+    geo3 de la zona con el dato más reciente. Los endpoints de diagnóstico la
+    usan cuando no se les pasa ninguna, para que el proyecto no dependa de una
+    zona concreta del despliegue original.
+    """
+    try:
+        zs = all_zones_tiered()
+        return zs[0]["geo3"] if zs else None
+    except Exception:
+        return None
+
+
+@app.route("/drift")
+@app.route("/drift/<geo3>")
+def drift_endpoint(geo3=None):
+    """
+    Deriva del factor de corrección (regla α-de-W). Sin zona, recorre las
+    activas. Lee pm_factor_history, que hasta ahora solo se escribía.
+    """
+    try:
+        if geo3:
+            zonas = [geo3]
+        else:
+            zonas = [z["geo3"] if isinstance(z, dict) else z
+                     for z in (active_zones() or [])]
+        out = {}
+        for g in zonas:
+            d = detect_factor_drift(g)
+            if d:
+                out[g] = d
+        return jsonify({
+            "enabled": DRIFT_ENABLE,
+            "window_days": DRIFT_W, "alpha": DRIFT_ALPHA,
+            "min_days": DRIFT_MIN_DAYS, "k_sigmas": DRIFT_K,
+            "band_min_pct": DRIFT_BAND_MIN_PCT,
+            "note": ("factor = referencia / sensor. Si sube, el sensor lee cada "
+                     "vez más bajo frente a la cabina."),
+            "zones": out,
+        })
+    except Exception as e:
+        log.exception("drift")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/esod-debug/<geo3>")
+def esod_debug(geo3):
+    """
+    Diagnóstico de ESOD-WH. Compara, métrica a métrica, lo que ve el crudo con
+    lo que sobrevive a la limpieza, y muestra el estado del repositorio
+    histórico. Es la forma de comprobar si el filtro de ventana estaba borrando
+    episodios reales.
+    """
+    try:
+        hours = int(request.args.get("hours", TIER3_HOURS))
+        mac = request.args.get("mac") or None
+        raw = fetch_zone_series(geo3, hours, mac=mac, info={})
+        if not raw:
+            return jsonify({"error": f"sin datos para {geo3}"}), 404
+        hist = _esod_hist_load(geo3, mac)
+        out = {}
+        for m, (t, v) in raw.items():
+            lo, hi = METRICS[m]["range"]
+            ok = (v >= lo) & (v <= hi)
+            vr = v[ok]
+            if len(vr) < 5:
+                continue
+            med = float(np.median(vr)); mad = float(np.median(np.abs(vr - med)))
+            techo = med + MAD_FACTOR * mad / 0.6745 if mad > 0 else None
+            th = (THRESHOLDS.get(m) or {}).get("warn")
+            # con ESOD-WH
+            _, vc, info = clean_series(t, v, m, hist=hist)
+            # sin ESOD-WH, para tener el antes/después en la misma llamada
+            global ESOD_ENABLE
+            _prev = ESOD_ENABLE; ESOD_ENABLE = False
+            try:
+                _, vc0, info0 = clean_series(t, v, m, hist=None)
+            finally:
+                ESOD_ENABLE = _prev
+            hh = hist.get(m) or {}
+            out[m] = {
+                "raw_points": int(len(vr)),
+                "raw_median": round(med, 2),
+                "raw_max": round(float(np.max(vr)), 2),
+                "mad_ceiling": round(techo, 2) if techo is not None else None,
+                "episode_threshold": th,
+                "threshold_above_ceiling": (
+                    bool(th is not None and techo is not None and th > techo)),
+                "hours_over_threshold_raw": (
+                    int(np.sum(vr >= th)) if th is not None else None),
+                "kept_without_esod": int(len(vc0)),
+                "kept_with_esod": int(len(vc)),
+                "rescued_history": info.get("rescued_history", 0),
+                "rescued_run": info.get("rescued_run", 0),
+                "dropped_outlier_before": info0.get("dropped_outlier", 0),
+                "dropped_outlier_now": info.get("dropped_outlier", 0),
+                "history_hours_ready": len(hh),
+                "history_min_n": ESOD_HIST_MIN_N,
+            }
+        return jsonify({
+            "geo3": geo3, "mac": mac, "hours": hours,
+            "esod_enabled": ESOD_ENABLE,
+            "run_hours": ESOD_RUN_H,
+            "hist_days": ESOD_HIST_DAYS,
+            "hist_k": ESOD_HIST_K,
+            "note": ("threshold_above_ceiling=true significa que el umbral de "
+                     "episodio está por encima del techo que impone el MAD: sin "
+                     "ESOD-WH ese episodio era imposible de detectar."),
+            "metrics": out,
+        })
+    except Exception as e:
+        log.exception("esod-debug")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/euskadi-debug")
-def euskadi_debug():
-    """Diagnóstico: descarga cada estación y reporta qué métricas trae."""
-    out = {"enabled": euskadi.EUSKADI_ENABLED,
-           "stations": euskadi.EUSKADI_STATIONS, "detail": {}}
-    for st in euskadi.EUSKADI_STATIONS:
+@app.route("/euskadi-debug/<geo3>")
+def euskadi_debug(geo3=None):
+    """
+    Diagnóstico de la red vasca. Sin argumento usa la zona de referencia
+    (EUSKADI_DEBUG_ZONE, o la primera zona activa); con
+    /euskadi-debug/<geo3> prueba esa zona.
+    Muestra el índice descubierto, qué estaciones elige por cercanía y qué
+    métricas aporta cada una.
+    """
+    geo3 = geo3 or os.getenv("EUSKADI_DEBUG_ZONE") or _primera_zona_activa()
+    out = {"enabled": euskadi.EUSKADI_ENABLED, "zone": geo3,
+           "radius_km": euskadi.EUSKADI_RADIUS_KM,
+           "max_fetch": euskadi.EUSKADI_MAX_FETCH,
+           "hour_offset": euskadi.EUSKADI_HOUR_OFFSET,
+           "forced_stations": euskadi.EUSKADI_STATIONS or None,
+           "detail": {}}
+    try:
+        idx = euskadi.fetch_station_index()
+        out["index_size"] = len(idx)
+    except Exception as e:
+        out["index_error"] = str(e)
+        return jsonify(out), 502
+
+    lat, lon, nsens = zone_sensor_center(geo3)
+    out["center"] = {"lat": round(lat, 4) if lat is not None else None,
+                     "lon": round(lon, 4) if lon is not None else None,
+                     "sensors_located": nsens}
+    try:
+        near = euskadi.resolve_stations(lat=lat, lon=lon)
+    except Exception as e:
+        out["select_error"] = str(e)
+        return jsonify(out), 502
+    out["selected"] = [{"name": s.get("name"), "slug": s.get("slug"),
+                        "dist_km": s.get("dist_km"), "town": s.get("town")}
+                       for s in near if isinstance(s, dict)]
+    for st in near:
+        label = st.get("name") if isinstance(st, dict) else st
         try:
             s = euskadi.fetch_station(st)
-            out["detail"][st] = {m: len(v) for m, v in s.items()} or "vacio"
+            out["detail"][label] = {m: len(v) for m, v in s.items()} or "vacio"
         except Exception as e:
-            out["detail"][st] = f"error: {e}"
+            out["detail"][label] = f"error: {e}"
     try:
-        combined, src = euskadi.fetch_official_series(72)
+        combined, src = euskadi.fetch_official_series(72, lat=lat, lon=lon)
         out["combined_metrics"] = {m: len(v) for m, v in combined.items()}
         out["sources"] = src
+        faltan = [m for m in euskadi.EUSKADI_TARGET_METRICS if m not in combined]
+        out["uncovered_metrics"] = faltan or None
     except Exception as e:
         out["combined_error"] = str(e)
+    return jsonify(out)
+
+@app.route("/openaq-debug")
+@app.route("/openaq-debug/<geo3>")
+def openaq_debug(geo3=None):
+    """
+    Diagnóstico de la referencia global OpenAQ para una zona: qué estaciones
+    oficiales hay en el radio, qué métricas miden y cuántas horas se obtienen.
+    """
+    geo3 = geo3 or os.getenv("OPENAQ_DEBUG_ZONE") or _primera_zona_activa()
+    hours = int(request.args.get("hours", 48))
+    lat, lon, nsens = zone_sensor_center(geo3)
+    if lat is None:
+        return jsonify({"error": f"sin posicion para la zona {geo3}"}), 404
+    try:
+        out = openaq.diagnose(lat, lon, hours=hours)
+    except Exception as e:
+        return jsonify({"zone": geo3, "error": str(e)}), 502
+    out["zone"] = geo3
+    out["center"] = {"lat": round(lat, 4), "lon": round(lon, 4),
+                     "sensors_located": nsens}
+    return jsonify(out)
+
+@app.route("/official-sources")
+def official_sources_endpoint():
+    """
+    Qué fuente de referencia oficial le toca a cada zona activa. Útil para ver
+    de un golpe cuántas zonas han dejado de depender solo de CAMS.
+    """
+    max_tier = int(request.args.get("max_tier", 2))
+    out = {"zones": [], "max_tier": max_tier}
+    try:
+        zones = all_zones_tiered()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    for z in zones:
+        if z.get("tier", 9) > max_tier:
+            continue
+        geo3 = z["geo3"]
+        lat, lon, nsens = zone_sensor_center(geo3)
+        row = {"geo3": geo3, "tier": z.get("tier"),
+               "lat": round(lat, 4) if lat else None,
+               "lon": round(lon, 4) if lon else None,
+               "sensors_located": nsens, "provider": None, "stations": []}
+        if lat is not None:
+            try:
+                near = euskadi.resolve_stations(lat=lat, lon=lon)
+            except Exception:
+                near = []
+            if near:
+                row["provider"] = "euskadi"
+                row["stations"] = [s.get("name") for s in near
+                                   if isinstance(s, dict)]
+            elif openaq.OPENAQ_ENABLED and openaq.OPENAQ_API_KEY:
+                try:
+                    locs = openaq.find_locations(lat, lon)
+                except Exception as e:
+                    row["error"] = str(e)
+                    locs = []
+                if locs:
+                    row["provider"] = "openaq"
+                    row["stations"] = [l["name"] for l in locs]
+        row["provider"] = row["provider"] or "cams"
+        out["zones"].append(row)
+    out["count"] = len(out["zones"])
     return jsonify(out)
 
 @app.route("/compare-official/<geo3>")
@@ -2395,6 +4628,8 @@ def compare_official_endpoint(geo3):
     if not zs:
         return jsonify({"error": f"sin datos suficientes para {geo3}"}), 404
     return jsonify({"geo3": geo3, "hours": hours,
+                    "official_provider": zs.get("official_provider"),
+                    "official_meta": zs.get("official_meta"),
                     "official_stations": zs.get("official_stations"),
                     "official_sources": zs.get("official_sources"),
                     "official_comparison": zs.get("official_comparison"),
@@ -2498,3 +4733,4 @@ if __name__ == "__main__":
              "on" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "off",
              DAILY_SUMMARY_HOUR)
     app.run(host="0.0.0.0", port=5000)
+
