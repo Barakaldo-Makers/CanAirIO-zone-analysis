@@ -110,6 +110,31 @@ TIER3_NO_WEATHER = os.getenv("TIER3_NO_WEATHER", "1") == "1"
 MAX_GAP_HOURS     = float(os.getenv("MAX_GAP_HOURS", "2"))
 MAD_FACTOR        = float(os.getenv("MAD_FACTOR", "5.0"))
 
+# ── ESOD-WH: ventana deslizante + repositorio histórico ──────────────────────
+# Allka, X. (UPC, 2025), "Enhancing Data Quality in IoT Monitoring Sensor
+# Networks", cap. 6. El filtrado con SOLO la ventana actual (ESOD-W) marca como
+# atípico un punto que es extremo en esa ventana aunque sea perfectamente normal
+# en la distribución histórica. Consecuencia medida aquí: con la mediana real de
+# la zona ezt (5,4 µg/m³) el MAD pone el techo en ~13,5 µg/m³, por debajo del
+# umbral de episodio de PM2.5 (25) y muy por debajo del crítico (75). Es decir,
+# clean_series borraba TODOS los episodios de PM antes de que detect_episodes()
+# y detect_alerts() los vieran. Nunca pudieron dispararse.
+#
+# ESOD-WH añade un segundo repositorio (el histórico) y solo descarta el punto
+# si es atípico en AMBOS. Aquí se implementan dos rescates:
+#   fH  - el valor cabe en la distribución histórica de su hora del día.
+#   run - el valor forma parte de una excursión sostenida (>= ESOD_RUN_H horas
+#         seguidas). Un fallo puntual de lectura no dura horas; un episodio sí.
+# El rescate por racha funciona desde el primer ciclo; el histórico necesita
+# acumular datos, así que al principio trabaja solo el primero.
+ESOD_ENABLE       = os.getenv("ESOD_ENABLE", "1") not in ("0", "false", "no")
+ESOD_RUN_H        = int(os.getenv("ESOD_RUN_H", "2"))        # horas seguidas
+ESOD_STUCK_H      = int(os.getenv("ESOD_STUCK_H", "6"))      # clavado = avería
+ESOD_HIST_DAYS    = int(os.getenv("ESOD_HIST_DAYS", "90"))   # ventana histórica
+ESOD_HIST_MIN_N   = int(os.getenv("ESOD_HIST_MIN_N", "14"))  # muestras/hora mín.
+ESOD_HIST_K       = float(os.getenv("ESOD_HIST_K", "1.5"))   # margen sobre p99
+ESOD_HIST_WRITE_H = int(os.getenv("ESOD_HIST_WRITE_H", "48"))  # horas a grabar
+
 # P1.1: Historical Forecast API (inicializada con observaciones reales, más
 # precisa que el pronóstico simple). Cobertura global, sin API key.
 OPEN_METEO_URL      = "https://api.open-meteo.com/v1/forecast"
@@ -381,10 +406,146 @@ def fetch_zone_series(geo3, hours, mac=None, info=None):
                  "; ".join(f"{m}: {len(v)}" for m, v in excluidos.items()))
     return series
 
-# ── Limpieza ─────────────────────────────────────────────────────────────────
-def clean_series(t, v, metric):
+# ── ESOD-WH: repositorio histórico (fH) ──────────────────────────────────────
+_ESOD_HIST_CACHE = {}   # (geo3, mac) -> (epoch_carga, hist)
+_ESOD_DB_LISTA = [False]
+
+def _esod_hist_key(mac):
+    return mac or "_zone"
+
+def _esod_db():
+    """Cliente sobre ANALYSIS_DB, creándola la primera vez si no existe."""
+    if not _ESOD_DB_LISTA[0]:
+        analysis_db_client().close()      # crea la BD si falta
+        _ESOD_DB_LISTA[0] = True
+    c = influx_client()
+    c.switch_database(ANALYSIS_DB)
+    return c
+
+def _esod_hist_save(geo3, mac, metric, t, v):
     """
-    1) Rango físico válido. 2) Outliers por MAD robusto (descarta |z|>MAD_FACTOR).
+    Graba en la BD de análisis los valores horarios que han pasado el rango
+    físico (ANTES del MAD: el histórico debe contener los episodios reales, no
+    solo lo que el filtro dejó pasar). Se escribe con el timestamp de la hora,
+    así que reescribir la misma hora en ciclos sucesivos es idempotente:
+    InfluxDB sobreescribe si coinciden measurement + tags + tiempo.
+    """
+    if not ESOD_ENABLE or len(v) == 0:
+        return
+    corte = time.time() - ESOD_HIST_WRITE_H * 3600.0
+    puntos = []
+    for ti, vi in zip(t, v):
+        if ti < corte:
+            continue
+        hod = int((ti % 86400) // 3600)
+        puntos.append({
+            "measurement": "esod_history",
+            "tags": {"geo3": geo3, "mac": _esod_hist_key(mac),
+                     "metric": metric, "hod": str(hod)},
+            "time": int(ti) * 1000000000,
+            "fields": {"v": float(vi)},
+        })
+    if not puntos:
+        return
+    try:
+        c = _esod_db()
+        c.write_points(puntos)
+        c.close()
+    except Exception as e:
+        log.debug("esod: no pude grabar histórico %s/%s: %s", geo3, metric, e)
+
+def _esod_hist_load(geo3, mac):
+    """
+    Devuelve {metric: {hod: {"p95": float, "n": int}}} de los últimos
+    ESOD_HIST_DAYS días. Dos consultas de una sola función cada una: InfluxQL 1.x
+    no admite mezclar selectores (PERCENTILE) con agregados (COUNT) en el mismo
+    SELECT. Cacheado por ciclo.
+    """
+    if not ESOD_ENABLE:
+        return {}
+    clave = (geo3, _esod_hist_key(mac))
+    ahora = time.time()
+    hit = _ESOD_HIST_CACHE.get(clave)
+    if hit and (ahora - hit[0]) < 900:
+        return hit[1]
+    hist = {}
+    try:
+        c = _esod_db()
+        base = (f"FROM \"esod_history\" WHERE \"geo3\"='{geo3}' "
+                f"AND \"mac\"='{_esod_hist_key(mac)}' "
+                f"AND time > now() - {ESOD_HIST_DAYS}d "
+                f"GROUP BY \"metric\",\"hod\"")
+        for campo, q in (("p95", f'SELECT PERCENTILE("v",95) AS p95 {base}'),
+                         ("n",   f'SELECT COUNT("v") AS n {base}')):
+            res = c.query(q)
+            for (_, tags), pts in res.items():
+                m = (tags or {}).get("metric"); hod = (tags or {}).get("hod")
+                if not m or hod is None:
+                    continue
+                fila = next(iter(pts), None)
+                if not fila or fila.get(campo) is None:
+                    continue
+                hist.setdefault(m, {}).setdefault(int(hod), {})[campo] = \
+                    float(fila[campo])
+        c.close()
+    except Exception as e:
+        log.debug("esod: no pude leer histórico %s: %s", geo3, e)
+        hist = {}
+    # descarta horas sin muestras suficientes para fiarse
+    limpio = {}
+    for m, horas in hist.items():
+        ok = {h: d for h, d in horas.items()
+              if d.get("n", 0) >= ESOD_HIST_MIN_N and d.get("p95") is not None}
+        if ok:
+            limpio[m] = ok
+    _ESOD_HIST_CACHE[clave] = (ahora, limpio)
+    return limpio
+
+def _esod_rescata(t, v, cand, hist_m):
+    """
+    Dado el vector de candidatos a atípico (cand, booleano), decide a cuáles se
+    les perdona la vida. Devuelve (rescatado_hist, rescatado_run), booleanos.
+
+      fH  -> el valor cabe en la distribución histórica de su hora del día
+             (<= p95 * ESOD_HIST_K).
+      run -> el candidato pertenece a una racha de >= ESOD_RUN_H candidatos
+             consecutivos. Si la racha llega a ESOD_STUCK_H horas con TODOS los
+             valores idénticos, es un sensor atascado y no se rescata. El
+             margen existe porque CanAirIO publica con poca resolución y un
+             episodio real corto puede dar valores repetidos de forma legítima;
+             seis horas clavadas en la misma cifra, no.
+    """
+    n = len(v)
+    r_hist = np.zeros(n, dtype=bool)
+    r_run = np.zeros(n, dtype=bool)
+    if hist_m:
+        for i in np.nonzero(cand)[0]:
+            d = hist_m.get(int((t[i] % 86400) // 3600))
+            if d and float(v[i]) <= d["p95"] * ESOD_HIST_K:
+                r_hist[i] = True
+    if ESOD_RUN_H > 1:
+        i = 0
+        while i < n:
+            if not cand[i]:
+                i += 1; continue
+            j = i
+            while j < n and cand[j]:
+                j += 1
+            tramo = v[i:j]
+            largo = j - i
+            atascado = (largo >= ESOD_STUCK_H
+                        and float(np.std(tramo)) <= 1e-9)
+            if largo >= ESOD_RUN_H and not atascado:
+                r_run[i:j] = True
+            i = j
+    return r_hist, r_run
+
+# ── Limpieza ─────────────────────────────────────────────────────────────────
+def clean_series(t, v, metric, hist=None):
+    """
+    1) Rango físico válido.
+    2) Atípicos por MAD sobre la ventana (ESOD-W) y rescate por histórico o por
+       racha sostenida (ESOD-WH). Ver el bloque ESOD_* arriba.
     3) Interpolación lineal solo de huecos <= MAX_GAP_HOURS.
     Devuelve (t, v, info_dict).
     """
@@ -392,13 +553,24 @@ def clean_series(t, v, metric):
     mask = (v >= lo) & (v <= hi)
     n_range = int((~mask).sum())
     t, v = t[mask], v[mask]
-    n_out = 0
+    n_out = 0; n_rh = 0; n_rr = 0
     if len(v) >= 5:
         med = np.median(v)
         mad = np.median(np.abs(v - med))
         if mad > 0:
             z = 0.6745 * (v - med) / mad
             keep = np.abs(z) <= MAD_FACTOR
+            if ESOD_ENABLE:
+                cand = ~keep
+                # solo se rescatan excursiones por ARRIBA: un valor
+                # anormalmente bajo en un sensor de contaminación es avería
+                # (óptica sucia, sensor ausente), no un episodio.
+                cand &= v > med
+                r_hist, r_run = _esod_rescata(t, v, cand,
+                                              (hist or {}).get(metric))
+                n_rh = int((r_hist & ~r_run).sum())
+                n_rr = int(r_run.sum())
+                keep = keep | r_hist | r_run
             n_out = int((~keep).sum())
             t, v = t[keep], v[keep]
     n_interp = 0
@@ -416,8 +588,18 @@ def clean_series(t, v, metric):
                 gap_ok &= ~bad
         n_interp = int(gap_ok.sum() - len(t)) if gap_ok.sum() > len(t) else 0
         t, v = grid[gap_ok], vi[gap_ok]
-    return t, v, {"dropped_range": n_range, "dropped_outlier": n_out,
-                  "interpolated": max(n_interp, 0)}
+    info = {"dropped_range": n_range, "dropped_outlier": n_out,
+            "interpolated": max(n_interp, 0)}
+    if ESOD_ENABLE and (n_rh or n_rr):
+        # horas que el filtro de ventana habría borrado y ESOD-WH ha salvado
+        info["rescued_history"] = n_rh
+        info["rescued_run"] = n_rr
+        info["rescue_note"] = (
+            f"{n_rh + n_rr} h marcadas como atípicas por la ventana se han "
+            f"conservado: {n_rr} por ser excursión sostenida (>= {ESOD_RUN_H} h) "
+            f"y {n_rh} por caber en la distribución histórica de su hora."
+        )
+    return t, v, info
 
 # ── Estadística ──────────────────────────────────────────────────────────────
 def analyze_series(t, v):
@@ -1518,8 +1700,20 @@ def zone_statistics(geo3, hours, mac=None):
     stats_by_metric = {}
     skipped = []
     discarded = {}
+    # ESOD-WH: repositorio histórico (fH) de esta zona/sensor. Una sola lectura
+    # por ciclo, cacheada; si está vacío el rescate se apoya solo en la racha.
+    hist = _esod_hist_load(geo3, mac)
     for m, (t, v) in raw.items():
-        tc, vc, info = clean_series(t, v, m)
+        # el histórico se alimenta con lo que pasa el rango físico, antes del
+        # MAD, para que contenga los episodios reales y no solo lo que el
+        # filtro dejó pasar
+        try:
+            lo_m, hi_m = METRICS[m]["range"]
+            ok_m = (v >= lo_m) & (v <= hi_m)
+            _esod_hist_save(geo3, mac, m, t[ok_m], v[ok_m])
+        except Exception as e:
+            log.debug("esod: histórico %s/%s no grabado: %s", geo3, m, e)
+        tc, vc, info = clean_series(t, v, m, hist=hist)
         if len(vc) < 6:
             # Antes esto era un 'continue' mudo y la métrica se esfumaba sin
             # explicación. Caso real: el nodo de gases leía NH3 ~1518 µg/m³, el
@@ -2769,6 +2963,75 @@ def _primera_zona_activa():
     except Exception:
         return None
 
+
+@app.route("/esod-debug/<geo3>")
+def esod_debug(geo3):
+    """
+    Diagnóstico de ESOD-WH. Compara, métrica a métrica, lo que ve el crudo con
+    lo que sobrevive a la limpieza, y muestra el estado del repositorio
+    histórico. Es la forma de comprobar si el filtro de ventana estaba borrando
+    episodios reales.
+    """
+    try:
+        hours = int(request.args.get("hours", TIER3_HOURS))
+        mac = request.args.get("mac") or None
+        raw = fetch_zone_series(geo3, hours, mac=mac, info={})
+        if not raw:
+            return jsonify({"error": f"sin datos para {geo3}"}), 404
+        hist = _esod_hist_load(geo3, mac)
+        out = {}
+        for m, (t, v) in raw.items():
+            lo, hi = METRICS[m]["range"]
+            ok = (v >= lo) & (v <= hi)
+            vr = v[ok]
+            if len(vr) < 5:
+                continue
+            med = float(np.median(vr)); mad = float(np.median(np.abs(vr - med)))
+            techo = med + MAD_FACTOR * mad / 0.6745 if mad > 0 else None
+            th = (THRESHOLDS.get(m) or {}).get("warn")
+            # con ESOD-WH
+            _, vc, info = clean_series(t, v, m, hist=hist)
+            # sin ESOD-WH, para tener el antes/después en la misma llamada
+            global ESOD_ENABLE
+            _prev = ESOD_ENABLE; ESOD_ENABLE = False
+            try:
+                _, vc0, info0 = clean_series(t, v, m, hist=None)
+            finally:
+                ESOD_ENABLE = _prev
+            hh = hist.get(m) or {}
+            out[m] = {
+                "raw_points": int(len(vr)),
+                "raw_median": round(med, 2),
+                "raw_max": round(float(np.max(vr)), 2),
+                "mad_ceiling": round(techo, 2) if techo is not None else None,
+                "episode_threshold": th,
+                "threshold_above_ceiling": (
+                    bool(th is not None and techo is not None and th > techo)),
+                "hours_over_threshold_raw": (
+                    int(np.sum(vr >= th)) if th is not None else None),
+                "kept_without_esod": int(len(vc0)),
+                "kept_with_esod": int(len(vc)),
+                "rescued_history": info.get("rescued_history", 0),
+                "rescued_run": info.get("rescued_run", 0),
+                "dropped_outlier_before": info0.get("dropped_outlier", 0),
+                "dropped_outlier_now": info.get("dropped_outlier", 0),
+                "history_hours_ready": len(hh),
+                "history_min_n": ESOD_HIST_MIN_N,
+            }
+        return jsonify({
+            "geo3": geo3, "mac": mac, "hours": hours,
+            "esod_enabled": ESOD_ENABLE,
+            "run_hours": ESOD_RUN_H,
+            "hist_days": ESOD_HIST_DAYS,
+            "hist_k": ESOD_HIST_K,
+            "note": ("threshold_above_ceiling=true significa que el umbral de "
+                     "episodio está por encima del techo que impone el MAD: sin "
+                     "ESOD-WH ese episodio era imposible de detectar."),
+            "metrics": out,
+        })
+    except Exception as e:
+        log.exception("esod-debug")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/euskadi-debug")
 @app.route("/euskadi-debug/<geo3>")

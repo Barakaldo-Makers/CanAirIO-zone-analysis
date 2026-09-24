@@ -62,6 +62,12 @@ otros cinco del mismo estilo.
 - **Estadística no paramétrica:** Mann-Kendall, pendiente de Theil-Sen,
   intervalos de confianza del 95 %, descarte de atípicos por MAD. Sin suponer
   normalidad.
+- **Filtrado de atípicos que no se come los episodios.** Descartar atípicos
+  mirando solo la ventana actual borra los picos reales de contaminación: en
+  nuestro despliegue el techo del MAD estaba en ~13,5 µg/m³ y el umbral de
+  episodio de PM2.5 es 25, así que *ningún* episodio podía detectarse. Ahora un
+  punto se conserva si cabe en la distribución histórica de su hora del día o si
+  forma parte de una excursión sostenida. Adaptado de Allka (UPC, 2025), cap. 6.
 - **Consenso entre sensores:** cada nodo contra la mediana de sus vecinos, que
   es como se detecta una unidad que ha derivado en silencio.
 - **Rosa de contaminación, CAQI, episodios sostenidos, perfiles horarios** y
@@ -136,6 +142,7 @@ Para tener cabinas reales fuera de una red local soportada, saca una
 | `GET /compare/<geo3>` · `/compare-official/<geo3>` | vs CAMS · vs cabinas oficiales |
 | `GET /official-sources` | qué referencia usa cada zona activa |
 | `GET /openaq-debug[/<geo3>]` · `/euskadi-debug[/<geo3>]` | diagnóstico de referencias |
+| `GET /esod-debug/<geo3>` | antes/después del filtrado y estado del histórico |
 | `GET /run-cycle` · `/publish` | fuerza un ciclo · fuerza la publicación |
 
 > Las estadísticas por métrica se publican bajo **`statistics`**, no `metrics`.

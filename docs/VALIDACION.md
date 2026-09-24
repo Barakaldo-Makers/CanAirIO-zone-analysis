@@ -1,4 +1,4 @@
-# Por qué hace falta validar: seis fallos que solo aparecen al contrastar
+# Por qué hace falta validar: siete fallos que solo aparecen al contrastar
 
 **CanAirIO-zone-analysis** · caso real, septiembre de 2026
 
@@ -7,8 +7,10 @@
 > señalara, y solo salieron a la luz al comparar contra cabinas oficiales.
 > Las cifras son medidas, no estimaciones.
 
-Lo que empezó como «no veo el NH3 en la web» destapó seis fallos de fondo, dos
-de ellos silenciosos desde hacía semanas. Este documento recoge qué pasaba, cómo
+Lo que empezó como «no veo el NH3 en la web» destapó siete fallos de fondo, tres
+de ellos silenciosos desde hacía semanas. El séptimo no lo encontró una queja
+sino una lectura: una tesis doctoral sobre calidad de datos en redes IoT
+describía exactamente el fallo que teníamos. Este documento recoge qué pasaba, cómo
 se detectó y qué se cambió, por orden de descubrimiento.
 
 ---
@@ -25,6 +27,7 @@ se detectó y qué se cambió, por orden de descubrimiento.
 | Factor de corrección PM2.5 | x0,664 (empeoraba) | **x1,233** |
 | Episodios detectados | 2, de humedad | **0** |
 | Métricas que desaparecían sin avisar | sí | no |
+| Episodios de PM detectables en una zona tranquila | **ninguno** | todos |
 
 Las cifras de arriba son medidas reales de la zona `ezt`, no estimaciones.
 
@@ -261,6 +264,95 @@ En Bilbao eso es un día normal: salían «2 episodios sostenidos» de humedad
 (82 % de media durante 9 h) que no dicen nada de la calidad del aire. Ahora
 solo contaminantes y ruido, vía `EPISODE_METRICS`.
 
+
+## 7. El limpiador borraba los episodios antes de detectarlos
+
+Este no lo destapó un síntoma, sino la lectura de una tesis: Allka, X. (UPC,
+2025), *Enhancing Data Quality in IoT Monitoring Sensor Networks*, capítulo 6.
+Su figura 6.1 describe un fallo concreto de los detectores de atípicos que
+trabajan solo con una ventana deslizante (que la tesis llama **ESOD-W**): marcan
+un punto como atípico **porque es extremo en esa ventana**, cuando es
+perfectamente normal **en la distribución histórica**.
+
+Es exactamente lo que hacía `clean_series()`: MAD sobre las 168 h, `MAD_FACTOR=5`,
+y nada más. Con la mediana real de la zona `ezt` eso pone el techo aquí:
+
+| | valor |
+|---|---|
+| Mediana de PM2.5 en la ventana | 5,4 µg/m³ |
+| Techo que impone el MAD | **~13,5 µg/m³** |
+| Umbral de episodio de PM2.5 (`THRESHOLDS`) | 25 |
+| Umbral crítico de PM2.5 | 75 |
+
+Y el orden de las operaciones remata el problema: `detect_episodes()` recibe
+`series_clean`, y `detect_alerts()` usa `last_value`, que también sale de la
+serie ya limpia. Es decir, **toda hora que superara el umbral se borraba antes
+de que el detector pudiera verla**. Medido sobre una ventana sintética con la
+mediana real de la zona:
+
+```
+episodio  6 h a 25 ug/m3 -> techo MAD 13.5 -> BORRADO por clean_series
+episodio  6 h a 50 ug/m3 -> techo MAD 13.5 -> BORRADO por clean_series
+episodio  6 h a 75 ug/m3 -> techo MAD 13.5 -> BORRADO por clean_series
+pm10, zona mediana 11: episodio a 150 -> techo 24.4 -> BORRADO
+```
+
+Ni los episodios de la web ni los avisos de Telegram podían dispararse por PM en
+una zona tranquila. No es que no hubiera episodios: es que no había forma de
+verlos. Y el fallo es invisible desde dentro, porque cada pieza por separado
+funciona bien.
+
+### Lo que se cambió: ESOD-WH
+
+La tesis propone añadir un **segundo repositorio** con el histórico y descartar
+el punto solo si es atípico en **ambos** (mide 10–30 % de mejora en precisión por
+ese añadido). Aquí se implementa con dos rescates:
+
+- **`fH`** — el valor cabe en la distribución histórica de su hora del día
+  (≤ p95 × `ESOD_HIST_K`, exigiendo al menos `ESOD_HIST_MIN_N` muestras de esa
+  hora antes de fiarse de ella).
+- **`run`** — el valor forma parte de una excursión sostenida de al menos
+  `ESOD_RUN_H` horas seguidas. Un fallo puntual de lectura no dura horas.
+
+Solo se rescatan excursiones **por arriba**: un valor anormalmente bajo en un
+sensor de contaminación es avería (óptica sucia, sensor ausente), no un episodio.
+
+El histórico vive en el measurement `esod_history` de la BD de análisis, con tags
+`geo3`/`mac`/`metric`/`hod` (hora del día). Se alimenta con lo que pasa el rango
+físico, **antes** del MAD: si se alimentara de la serie limpia sería circular y
+nunca aprendería que un episodio es posible. Se graba con el timestamp de la
+hora, así que reescribir las últimas horas en cada ciclo es idempotente.
+
+**Guard anti-avería.** Una racha de `ESOD_STUCK_H` horas o más con **todos** los
+valores idénticos es un sensor atascado y no se rescata. La primera versión
+rechazaba cualquier racha de valor constante, y el test lo tumbó: CanAirIO
+publica con poca resolución y un episodio corto puede dar cifras repetidas de
+forma legítima. Seis horas clavadas en la misma cifra, no.
+
+Comportamiento verificado sobre el `clean_series` real:
+
+| caso | antes | ahora |
+|---|---|---|
+| Episodio 6 h ~45 µg/m³ | 6 h borradas | **conservadas** (`run`) |
+| Episodio 12 h ~75 µg/m³ (crítico) | 12 h borradas | **conservadas** |
+| Episodio 2 h ~30 µg/m³ (duración mínima) | 2 h borradas | **conservadas** |
+| Episodio 3 h a 45,0 exactos (cuantizado) | 3 h borradas | **conservadas** |
+| Pico suelto de 1 h a 60 / 120 / 300 | filtrado | filtrado |
+| Pico de 1 h a 60 con histórico p95 = 80 | filtrado | **conservado** (`fH`) |
+| Pico de 1 h a 300 con histórico p95 = 80 | filtrado | filtrado |
+| Sensor atascado 8 h y 24 h a 40,0 exactos | filtrado | filtrado |
+| Ventana normal sin episodio | sin cambios | sin cambios |
+
+El filtro no se ha aflojado: lo que era basura sigue cayendo.
+
+**Limitación honesta:** el repositorio histórico empieza vacío y necesita unas
+dos semanas de datos antes de que `fH` aporte algo. Hasta entonces trabaja solo
+el rescate por racha, que es el que corrige el fallo desde el primer ciclo. La
+fecha en que `fH` entra en juego se ve en `history_hours_ready` de
+`/esod-debug/<geo3>`.
+
+---
+
 ---
 
 ## Cambios en la web (`index.html`)
@@ -302,6 +394,15 @@ ZERO_MEANS_ABSENT=1
 # Etiquetas y episodios
 CONF_BIAS_FAIR=50
 EPISODE_METRICS=pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db
+
+# ESOD-WH: ventana deslizante + repositorio histórico
+ESOD_ENABLE=1          # 0 = comportamiento anterior (solo ventana)
+ESOD_RUN_H=2           # horas seguidas para considerarlo excursión real
+ESOD_STUCK_H=6         # horas clavadas en la misma cifra = avería
+ESOD_HIST_DAYS=90      # ventana del repositorio histórico
+ESOD_HIST_MIN_N=14     # muestras mínimas de una hora para fiarse de ella
+ESOD_HIST_K=1.5        # margen sobre el p95 histórico
+ESOD_HIST_WRITE_H=48   # horas que se regraban en cada ciclo
 ```
 
 ---
@@ -312,11 +413,12 @@ EPISODE_METRICS=pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db
 /official-sources[?max_tier=N]   qué referencia usa cada zona activa
 /euskadi-debug[/<geo3>]          índice de la red vasca, selección y cobertura
 /openaq-debug[/<geo3>]           estaciones OpenAQ del radio y métricas
+/esod-debug/<geo3>               antes/después del filtrado, estado del histórico
 ```
 
 `/analysis/<geo3>` añade: `aggregation`, `discarded_metrics`,
-`official_provider`, `official_meta`, y `applied_*` dentro de
-`pm_corrections`.
+`official_provider`, `official_meta`, `applied_*` dentro de `pm_corrections`, y
+`rescued_history` / `rescued_run` / `rescue_note` dentro de `cleaning`.
 
 > **Ojo al leer la API:** las estadísticas por métrica se publican como
 > **`statistics`**, no `metrics` (`result["statistics"] = zs["metrics"]`).

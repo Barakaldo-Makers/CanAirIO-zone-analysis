@@ -61,6 +61,12 @@ same kind.
   precedence so only one corrected figure is ever published.
 - **Non-parametric statistics:** Mann-Kendall trend, Theil-Sen slope, 95 %
   confidence intervals, MAD outlier rejection. No assumption of normality.
+- **Outlier filtering that does not eat real episodes.** Rejecting outliers on
+  the current window alone deletes genuine pollution spikes: in our own
+  deployment the MAD ceiling sat at ~13.5 µg/m³ while the PM2.5 episode
+  threshold is 25, so *no* episode could ever be detected. A point is now kept
+  if it fits the historical distribution for its hour of day, or if it is part
+  of a sustained excursion. Adapted from Allka (UPC, 2025), ch. 6.
 - **Cross-sensor consensus:** each node against the median of its neighbours,
   which is how you catch a unit that has quietly drifted.
 - **Pollution rose, CAQI, sustained episodes, hourly profiles,** and
@@ -134,6 +140,7 @@ For real stations outside a supported local network, get a free
 | `GET /compare/<geo3>` · `/compare-official/<geo3>` | vs CAMS · vs official stations |
 | `GET /official-sources` | which reference each active zone is using |
 | `GET /openaq-debug[/<geo3>]` · `/euskadi-debug[/<geo3>]` | reference diagnostics |
+| `GET /esod-debug/<geo3>` | outlier filtering before/after, history state |
 | `GET /run-cycle` · `/publish` | force a cycle · force publication |
 
 > Per-metric statistics are published under **`statistics`**, not `metrics`.
