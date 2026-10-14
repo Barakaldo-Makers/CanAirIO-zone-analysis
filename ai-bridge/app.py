@@ -1564,6 +1564,38 @@ def fetch_series_by_sensor(geo3, hours):
 
 CROSS_MIN_SENSORS = int(os.getenv("CROSS_MIN_SENSORS", "3"))
 CROSS_MIN_N = int(os.getenv("CROSS_MIN_N", "12"))
+# Distancia máxima entre sensores para el consenso local (issue #9).
+# geo3 = 3 chars ≈ 156 km; nodos a 20 km no miden el mismo aire.
+CROSS_MAX_KM = float(os.getenv("CROSS_MAX_KM", "5.0"))
+
+def _sensor_distance(mac_a, mac_b):
+    """Distancia haversine entre dos sensores por su posición geo (7 chars)."""
+    try:
+        c = influx_client()
+        positions = {}
+        for mac in (mac_a, mac_b):
+            q = (f'SELECT last("geo") AS geo FROM "{MEASUREMENT}" '
+                 f'WHERE "mac" = \'{mac}\' AND time > now() - 48h')
+            res = c.query(q)
+            for (_m, _t), pts in res.items():
+                p0 = next(iter(pts), {})
+                g = p0.get("geo")
+                if g:
+                    try:
+                        positions[mac] = geohash_center(g)
+                    except Exception:
+                        pass
+        c.close()
+        if mac_a not in positions or mac_b not in positions:
+            return None
+        (la1, lo1), (la2, lo2) = positions[mac_a], positions[mac_b]
+        R = 6371.0
+        dla, dlo = math.radians(la2 - la1), math.radians(lo2 - lo1)
+        a = math.sin(dla/2)**2 + math.cos(math.radians(la1)) * math.cos(math.radians(la2)) * math.sin(dlo/2)**2
+        return 2 * R * math.asin(math.sqrt(a))
+    except Exception:
+        return None
+
 
 def cross_sensor_validation(geo3, hours):
     """
@@ -1594,7 +1626,8 @@ def cross_sensor_validation(geo3, hours):
             pairs = []
             for h, v in mine.items():
                 others = [data[o][m][h] for o in macs
-                          if o != mac and h in data[o][m]]
+                          if o != mac and h in data[o][m]
+                          and _sensor_distance(mac, o) <= CROSS_MAX_KM]
                 if len(others) >= 2:      # consenso necesita >=2 vecinos
                     pairs.append((v, float(np.median(others))))
             if len(pairs) < CROSS_MIN_N:
@@ -2696,6 +2729,38 @@ def fetch_series_by_sensor(geo3, hours):
 
 CROSS_MIN_SENSORS = int(os.getenv("CROSS_MIN_SENSORS", "3"))
 CROSS_MIN_N = int(os.getenv("CROSS_MIN_N", "12"))
+# Distancia máxima entre sensores para el consenso local (issue #9).
+# geo3 = 3 chars ≈ 156 km; nodos a 20 km no miden el mismo aire.
+CROSS_MAX_KM = float(os.getenv("CROSS_MAX_KM", "5.0"))
+
+def _sensor_distance(mac_a, mac_b):
+    """Distancia haversine entre dos sensores por su posición geo (7 chars)."""
+    try:
+        c = influx_client()
+        positions = {}
+        for mac in (mac_a, mac_b):
+            q = (f'SELECT last("geo") AS geo FROM "{MEASUREMENT}" '
+                 f'WHERE "mac" = \'{mac}\' AND time > now() - 48h')
+            res = c.query(q)
+            for (_m, _t), pts in res.items():
+                p0 = next(iter(pts), {})
+                g = p0.get("geo")
+                if g:
+                    try:
+                        positions[mac] = geohash_center(g)
+                    except Exception:
+                        pass
+        c.close()
+        if mac_a not in positions or mac_b not in positions:
+            return None
+        (la1, lo1), (la2, lo2) = positions[mac_a], positions[mac_b]
+        R = 6371.0
+        dla, dlo = math.radians(la2 - la1), math.radians(lo2 - lo1)
+        a = math.sin(dla/2)**2 + math.cos(math.radians(la1)) * math.cos(math.radians(la2)) * math.sin(dlo/2)**2
+        return 2 * R * math.asin(math.sqrt(a))
+    except Exception:
+        return None
+
 
 def cross_sensor_validation(geo3, hours):
     """
@@ -2726,7 +2791,8 @@ def cross_sensor_validation(geo3, hours):
             pairs = []
             for h, v in mine.items():
                 others = [data[o][m][h] for o in macs
-                          if o != mac and h in data[o][m]]
+                          if o != mac and h in data[o][m]
+                          and _sensor_distance(mac, o) <= CROSS_MAX_KM]
                 if len(others) >= 2:      # consenso necesita >=2 vecinos
                     pairs.append((v, float(np.median(others))))
             if len(pairs) < CROSS_MIN_N:
@@ -4063,6 +4129,23 @@ def collect_sensors():
     return rows
 
 
+def _sensor_last_time(mac):
+    """Última lectura de un sensor en ISO UTC, o None."""
+    try:
+        c = influx_client()
+        q = (f'SELECT last("pm25") AS v FROM "{MEASUREMENT}" '
+             f'WHERE "mac" = \'{mac}\' AND time > now() - {SENSORS_ACTIVE_HOURS * 24}h')
+        res = c.query(q, epoch="s")
+        for (_m, _t), pts in res.items():
+            p0 = next(iter(pts), {})
+            if p0.get("time"):
+                return datetime.fromtimestamp(int(p0["time"]), tz=timezone.utc).isoformat()
+        c.close()
+    except Exception:
+        pass
+    return None
+
+
 def _read_metrics_conf(p):
     """{metrica: {rho, bias_pct, n}} desde la BD de análisis."""
     try:
@@ -4098,6 +4181,34 @@ def _read_metrics_conf(p):
     except Exception as e:
         log.warning("metrics_conf no disponible: %s", e)
         return {}
+
+
+def _load_ref_history(days):
+    """{geo3: {epoch_s: {pm25, source, n}}} desde ref_history."""
+    out = {}
+    try:
+        c = _esod_db()
+        w = f'WHERE time > now() - {days}d AND "metric" = \'pm25\''
+        res = c.query(f'SELECT mean("v") AS v FROM "ref_history" {w} '
+                      f'GROUP BY "geo3", "provider", time(1h) fill(none)')
+        for (_m, tags), pts in res.items():
+            if not tags or not tags.get("geo3"):
+                continue
+            g = tags["geo3"]
+            prov = tags.get("provider") or "oficial"
+            for p in pts:
+                t = int(p["time"])
+                v = p.get("v")
+                if v is None:
+                    continue
+                entry = out.setdefault(g, {}).setdefault(t, {})
+                entry["pm25"] = round(float(v), 2)
+                entry["source"] = prov
+                entry["n"] = entry.get("n", 0) + 1
+        c.close()
+    except Exception as e:
+        log.warning("ref_history no disponible: %s", e)
+    return out
 
 
 def publish_site():
@@ -4160,6 +4271,12 @@ def publish_site():
                 # referencia usada para validar: euskadi | openaq | cams
                 "ref_source": p.get("refsrc") or "cams",
                 "ref_stations": p.get("refsts") or "",
+                # Declarar qué ventana representa cada número (issue #6)
+                "windows": {
+                    "pm25": "último punto de la BD (1h)",
+                    "caqi_pm25": "media 24h (CAQI)",
+                    "noise_db": "último punto de la BD (1h)",
+                },
             })
         # histórico para timeline/gráficas: series por hora por zona
         hist = c.query(
@@ -4167,16 +4284,25 @@ def publish_site():
             f'mean("db_last") AS noise_db, mean("status_code") AS status '
             f'FROM "{ANALYSIS_MEAS}" WHERE time > now() - {publisher.HISTORY_DAYS}d '
             f'GROUP BY "geo3", time(1h) fill(none)')
+        # Serie de referencia oficial por zona (issue #4)
+        ref_hist = _load_ref_history(publisher.HISTORY_DAYS)
         points = []
         for (mname, tags), pts in hist.items():
             if not tags:
                 continue
             g = tags.get("geo3")
             for p in pts:
-                points.append({"geo3": g, "t": p["time"],
-                               "aqi": _r(p.get("aqi")), "pm25": _r(p.get("pm25")),
-                               "noise_db": _r(p.get("noise_db")),
-                               "status": _r(p.get("status"))})
+                pt = {"geo3": g, "t": p["time"],
+                      "aqi": _r(p.get("aqi")), "pm25": _r(p.get("pm25")),
+                      "noise_db": _r(p.get("noise_db")),
+                      "status": _r(p.get("status"))}
+                # Añadir referencia si existe para esta zona y hora
+                ref_entry = ref_hist.get(g, {}).get(p["time"])
+                if ref_entry:
+                    pt["ref_pm25"] = ref_entry.get("pm25")
+                    pt["ref_source"] = ref_entry.get("source", "oficial")
+                    pt["ref_n"] = ref_entry.get("n", 0)
+                points.append(pt)
         c.close()
         # análisis individual por sensor dentro de cada zona
         nombres = _sensor_names()
@@ -4216,6 +4342,7 @@ def publish_site():
                     # (ej. NH3 leyendo 1520 µg/m³, fuera del rango 0-400)
                     "discarded_metrics": r.get("discarded_metrics"),
                     "points": s["points"],
+                    "last_time": _sensor_last_time(s["mac"]),
                 })
             z["sensors"] = sens_list
             # notas de zona: consenso entre sensores, rosa, CAQI, episodios y corr. ambiental
