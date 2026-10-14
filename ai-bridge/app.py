@@ -188,8 +188,14 @@ METRICS = {
     "pm25": {"label": "PM2.5 (µg/m³)", "range": (0, 500)},
     "pm10": {"label": "PM10 (µg/m³)",  "range": (0, 1000)},
     "pm1":  {"label": "PM1 (µg/m³)",   "range": (0, 500)},
+    # PM4: el SPS30 lo mide; es la fracción grasa fina y permite diagnosticar
+    # por qué PM10 colapsa sobre PM2.5 (issue #17).
+    "pm4":  {"label": "PM4 (µg/m³)",    "range": (0, 1000)},
     "co2":  {"label": "CO2 (ppm)",     "range": (300, 5000)},
     "co":   {"label": "CO (mg/m³)",    "range": (0, 120)},
+    # SO2: contaminante obligatorio de la Directiva 2008/50/CE y del RD 102/2011,
+    # y la red vasca lo mide. Faltaba por completo del modelo (issue #10).
+    "so2":  {"label": "SO2 (µg/m³)",   "range": (0, 500)},
     "no2":  {"label": "NO2 (µg/m³)",   "range": (0, 1000)},
     "o3":   {"label": "O3 (µg/m³)",    "range": (0, 500)},
     "nh3":  {"label": "NH3 (µg/m³)",   "range": (0, 400)},
@@ -215,6 +221,7 @@ THRESHOLDS = {
     "pm10": {"warn": 50,   "critical": 150},
     "co2":  {"warn": 1000, "critical": 2000},
     "co":   {"warn": 10,   "critical": 35},
+    "so2":  {"warn": 125,  "critical": 350},
     "no2":  {"warn": 40,   "critical": 200},
     "nh3":  {"warn": 25,   "critical": 50},
     "o3":   {"warn": 100,  "critical": 180},
@@ -1106,8 +1113,8 @@ def weathercode_icon(code):
 
 # ── Comparación con referencia regional CAMS (Copernicus) ───────────────────
 # Mapeo metrica del sensor -> variable equivalente en la API de Open-Meteo AQ.
-SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "no2": "nitrogen_dioxide",
-            "o3": "ozone"}
+SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "so2": "sulphur_dioxide",
+            "no2": "nitrogen_dioxide", "o3": "ozone"}
 _sat_cache = {}
 
 def fetch_reference(geo3, hours):
@@ -1218,6 +1225,11 @@ CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "50"))   # |sesgo%| <= -> ok
 # 'dudoso': sigue sirviendo para tendencias y alertas, pero su valor absoluto
 # necesita el factor de correccion antes de darlo por bueno.
 CONF_BIAS_BAD   = float(os.getenv("CONF_BIAS_BAD", "300"))   # |sesgo%| > -> malo
+# Sobrelectura: un factor > 5 significa que el sensor lee menos del 20% de lo
+# real (sesgo < -80%). Antes la regla solo castigaba sesgo > +300%, así que un
+# nodo que leía 1/18 de lo real pasaba como "dudoso" y entraba en alertas.
+# Issue #3.
+SOBRELECTURA_FACTOR = float(os.getenv("SOBRELECTURA_FACTOR", "5.0"))
 CONF_MIN_N      = int(os.getenv("CONF_MIN_N", "12"))         # pares minimos
 
 # Correccion de PM: los sensores opticos baratos subestiman de forma
@@ -1815,7 +1827,7 @@ EPISODE_MIN_HOURS = int(os.getenv("EPISODE_MIN_HOURS", "2"))  # min duración
 # "episodios sostenidos de humedad" que no dicen nada de la calidad del aire.
 # La temperatura queda fuera por el mismo motivo (es contexto, no episodio).
 EPISODE_METRICS = set(m.strip() for m in os.getenv(
-    "EPISODE_METRICS", "pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db").split(",")
+    "EPISODE_METRICS", "pm25,pm10,pm4,so2,no2,o3,nh3,co,co2,db").split(",")
     if m.strip())
 
 def detect_episodes(series_clean, confidence=None):
@@ -2233,8 +2245,8 @@ def weathercode_icon(code):
 
 # ── Comparación con referencia regional CAMS (Copernicus) ───────────────────
 # Mapeo metrica del sensor -> variable equivalente en la API de Open-Meteo AQ.
-SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "no2": "nitrogen_dioxide",
-            "o3": "ozone"}
+SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "so2": "sulphur_dioxide",
+            "no2": "nitrogen_dioxide", "o3": "ozone"}
 _sat_cache = {}
 
 def fetch_reference(geo3, hours):
@@ -2345,6 +2357,11 @@ CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "50"))   # |sesgo%| <= -> ok
 # 'dudoso': sigue sirviendo para tendencias y alertas, pero su valor absoluto
 # necesita el factor de correccion antes de darlo por bueno.
 CONF_BIAS_BAD   = float(os.getenv("CONF_BIAS_BAD", "300"))   # |sesgo%| > -> malo
+# Sobrelectura: un factor > 5 significa que el sensor lee menos del 20% de lo
+# real (sesgo < -80%). Antes la regla solo castigaba sesgo > +300%, así que un
+# nodo que leía 1/18 de lo real pasaba como "dudoso" y entraba en alertas.
+# Issue #3.
+SOBRELECTURA_FACTOR = float(os.getenv("SOBRELECTURA_FACTOR", "5.0"))
 CONF_MIN_N      = int(os.getenv("CONF_MIN_N", "12"))         # pares minimos
 
 # Correccion de PM: los sensores opticos baratos subestiman de forma
@@ -2942,7 +2959,7 @@ EPISODE_MIN_HOURS = int(os.getenv("EPISODE_MIN_HOURS", "2"))  # min duración
 # "episodios sostenidos de humedad" que no dicen nada de la calidad del aire.
 # La temperatura queda fuera por el mismo motivo (es contexto, no episodio).
 EPISODE_METRICS = set(m.strip() for m in os.getenv(
-    "EPISODE_METRICS", "pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db").split(",")
+    "EPISODE_METRICS", "pm25,pm10,pm4,so2,no2,o3,nh3,co,co2,db").split(",")
     if m.strip())
 
 def detect_episodes(series_clean, confidence=None):
@@ -4046,6 +4063,43 @@ def collect_sensors():
     return rows
 
 
+def _read_metrics_conf(p):
+    """{metrica: {rho, bias_pct, n}} desde la BD de análisis."""
+    try:
+        c = analysis_db_client()
+        q = (f'SELECT last("pm25_rho") AS rho25, last("pm10_rho") AS rho10, '
+             f'last("no2_rho") AS rho_no2, last("o3_rho") AS rho_o3, '
+             f'last("pm25_bias") AS b25, last("pm10_bias") AS b10, '
+             f'last("no2_bias") AS b_no2, last("o3_bias") AS b_o3, '
+             f'last("pm25_n") AS n25, last("pm10_n") AS n10, '
+             f'last("no2_n") AS n_no2, last("o3_n") AS n_o3 '
+             f'FROM "{ANALYSIS_MEAS}" WHERE time > now() - 6h '
+             f'GROUP BY "geo3"')
+        out = {}
+        for (_m, tags), pts in c.query(q).items():
+            if not tags or not tags.get("geo3"):
+                continue
+            g = tags["geo3"]
+            p0 = next(iter(pts), {})
+            entry = {}
+            for metric, rkc, bkc, nkc in (
+                ("pm25", "rho25", "b25", "n25"),
+                ("pm10", "rho10", "b10", "n10"),
+                ("no2", "rho_no2", "b_no2", "n_no2"),
+                ("o3", "rho_o3", "b_o3", "n_o3"),
+            ):
+                rho = p0.get(rkc); bias = p0.get(bkc); nn = p0.get(nkc)
+                if rho is not None or bias is not None or nn is not None:
+                    entry[metric] = {"rho": rho, "bias_pct": bias, "n": nn}
+            if entry:
+                out[g] = entry
+        c.close()
+        return out
+    except Exception as e:
+        log.warning("metrics_conf no disponible: %s", e)
+        return {}
+
+
 def publish_site():
     """Recopila estado actual + histórico de la BD analysis y publica a Pages."""
     try:
@@ -4080,7 +4134,7 @@ def publish_site():
             zones.append({
                 "geo3": tags.get("geo3"),
                 "status": st_name.get(int(p.get("sc") or 0), "?"),
-                "aqi": int(p.get("aqi") or 0),
+                "aqi": p.get("aqi"),   # None si no hay dato: 0 es "aire óptimo" (issue #2)
                 "pm25": p.get("pm25"), "noise_db": p.get("db"),
                 "no2": p.get("no2"), "wind_kmh": p.get("wind"),
                 "wind_dir_txt": p.get("wdir"),
@@ -4099,6 +4153,9 @@ def publish_site():
                 "prediction": p.get("pred") or "",
                 "confidence": {"pm25": cf("pm25c"), "pm10": cf("pm10c"),
                                "no2": cf("no2c"), "o3": cf("o3c")},
+                # rho / sesgo / n por métrica: la web ya los lee, pero el
+                # backend no los publicaba. Issue #5.
+                "metrics_conf": _read_metrics_conf(p),
                 "pm25_corr_factor": p.get("pm25f"),
                 # referencia usada para validar: euskadi | openaq | cams
                 "ref_source": p.get("refsrc") or "cams",
