@@ -41,5 +41,14 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+*.code-workspace
 *.swp
 *~
+
+# ─── Scripts de despliegue local ─────────────────────────────────────
+# Los parches que se aplican sobre un despliegue propio no son parte del
+# proyecto: llevan un payload embebido, pesan decenas de KB y quedan en el
+# historial de todos los que clonen. Se ejecutan desde el repo, así que sin
+# esta regla acaban dentro sin querer.
+parche-*.sh
+migrar*.sh
