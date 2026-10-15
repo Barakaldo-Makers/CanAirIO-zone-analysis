@@ -91,7 +91,10 @@ def export_sensors(sensor_rows, ranges=None):
     os.makedirs(data_dir, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
     payload = {"generated_at": now, "count": len(sensor_rows),
-               "ranges": ranges or {}, "sensors": sensor_rows}
+               "ranges": ranges or {}, "sensors": sensor_rows,
+               # Declarar qué representa cada campo (issue #16)
+               "fields_note": ("last_* = última lectura del sensor; "
+                               "mean_* = media de las últimas 48h")}
     try:
         with open(os.path.join(data_dir, "sensors.json"), "w",
                   encoding="utf-8") as f:

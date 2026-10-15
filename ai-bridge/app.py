@@ -188,8 +188,14 @@ METRICS = {
     "pm25": {"label": "PM2.5 (µg/m³)", "range": (0, 500)},
     "pm10": {"label": "PM10 (µg/m³)",  "range": (0, 1000)},
     "pm1":  {"label": "PM1 (µg/m³)",   "range": (0, 500)},
+    # PM4: el SPS30 lo mide; es la fracción grasa fina y permite diagnosticar
+    # por qué PM10 colapsa sobre PM2.5 (issue #17).
+    "pm4":  {"label": "PM4 (µg/m³)",    "range": (0, 1000)},
     "co2":  {"label": "CO2 (ppm)",     "range": (300, 5000)},
     "co":   {"label": "CO (mg/m³)",    "range": (0, 120)},
+    # SO2: contaminante obligatorio de la Directiva 2008/50/CE y del RD 102/2011,
+    # y la red vasca lo mide. Faltaba por completo del modelo (issue #10).
+    "so2":  {"label": "SO2 (µg/m³)",   "range": (0, 500)},
     "no2":  {"label": "NO2 (µg/m³)",   "range": (0, 1000)},
     "o3":   {"label": "O3 (µg/m³)",    "range": (0, 500)},
     "nh3":  {"label": "NH3 (µg/m³)",   "range": (0, 400)},
@@ -215,6 +221,7 @@ THRESHOLDS = {
     "pm10": {"warn": 50,   "critical": 150},
     "co2":  {"warn": 1000, "critical": 2000},
     "co":   {"warn": 10,   "critical": 35},
+    "so2":  {"warn": 125,  "critical": 350},
     "no2":  {"warn": 40,   "critical": 200},
     "nh3":  {"warn": 25,   "critical": 50},
     "o3":   {"warn": 100,  "critical": 180},
@@ -1106,8 +1113,8 @@ def weathercode_icon(code):
 
 # ── Comparación con referencia regional CAMS (Copernicus) ───────────────────
 # Mapeo metrica del sensor -> variable equivalente en la API de Open-Meteo AQ.
-SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "no2": "nitrogen_dioxide",
-            "o3": "ozone"}
+SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "so2": "sulphur_dioxide",
+            "no2": "nitrogen_dioxide", "o3": "ozone"}
 _sat_cache = {}
 
 def fetch_reference(geo3, hours):
@@ -1218,6 +1225,11 @@ CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "50"))   # |sesgo%| <= -> ok
 # 'dudoso': sigue sirviendo para tendencias y alertas, pero su valor absoluto
 # necesita el factor de correccion antes de darlo por bueno.
 CONF_BIAS_BAD   = float(os.getenv("CONF_BIAS_BAD", "300"))   # |sesgo%| > -> malo
+# Sobrelectura: un factor > 5 significa que el sensor lee menos del 20% de lo
+# real (sesgo < -80%). Antes la regla solo castigaba sesgo > +300%, así que un
+# nodo que leía 1/18 de lo real pasaba como "dudoso" y entraba en alertas.
+# Issue #3.
+SOBRELECTURA_FACTOR = float(os.getenv("SOBRELECTURA_FACTOR", "5.0"))
 CONF_MIN_N      = int(os.getenv("CONF_MIN_N", "12"))         # pares minimos
 
 # Correccion de PM: los sensores opticos baratos subestiman de forma
@@ -1552,6 +1564,38 @@ def fetch_series_by_sensor(geo3, hours):
 
 CROSS_MIN_SENSORS = int(os.getenv("CROSS_MIN_SENSORS", "3"))
 CROSS_MIN_N = int(os.getenv("CROSS_MIN_N", "12"))
+# Distancia máxima entre sensores para el consenso local (issue #9).
+# geo3 = 3 chars ≈ 156 km; nodos a 20 km no miden el mismo aire.
+CROSS_MAX_KM = float(os.getenv("CROSS_MAX_KM", "5.0"))
+
+def _sensor_distance(mac_a, mac_b):
+    """Distancia haversine entre dos sensores por su posición geo (7 chars)."""
+    try:
+        c = influx_client()
+        positions = {}
+        for mac in (mac_a, mac_b):
+            q = (f'SELECT last("geo") AS geo FROM "{MEASUREMENT}" '
+                 f'WHERE "mac" = \'{mac}\' AND time > now() - 48h')
+            res = c.query(q)
+            for (_m, _t), pts in res.items():
+                p0 = next(iter(pts), {})
+                g = p0.get("geo")
+                if g:
+                    try:
+                        positions[mac] = geohash_center(g)
+                    except Exception:
+                        pass
+        c.close()
+        if mac_a not in positions or mac_b not in positions:
+            return None
+        (la1, lo1), (la2, lo2) = positions[mac_a], positions[mac_b]
+        R = 6371.0
+        dla, dlo = math.radians(la2 - la1), math.radians(lo2 - lo1)
+        a = math.sin(dla/2)**2 + math.cos(math.radians(la1)) * math.cos(math.radians(la2)) * math.sin(dlo/2)**2
+        return 2 * R * math.asin(math.sqrt(a))
+    except Exception:
+        return None
+
 
 def cross_sensor_validation(geo3, hours):
     """
@@ -1582,7 +1626,8 @@ def cross_sensor_validation(geo3, hours):
             pairs = []
             for h, v in mine.items():
                 others = [data[o][m][h] for o in macs
-                          if o != mac and h in data[o][m]]
+                          if o != mac and h in data[o][m]
+                          and _sensor_distance(mac, o) <= CROSS_MAX_KM]
                 if len(others) >= 2:      # consenso necesita >=2 vecinos
                     pairs.append((v, float(np.median(others))))
             if len(pairs) < CROSS_MIN_N:
@@ -1815,7 +1860,7 @@ EPISODE_MIN_HOURS = int(os.getenv("EPISODE_MIN_HOURS", "2"))  # min duración
 # "episodios sostenidos de humedad" que no dicen nada de la calidad del aire.
 # La temperatura queda fuera por el mismo motivo (es contexto, no episodio).
 EPISODE_METRICS = set(m.strip() for m in os.getenv(
-    "EPISODE_METRICS", "pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db").split(",")
+    "EPISODE_METRICS", "pm25,pm10,pm4,so2,no2,o3,nh3,co,co2,db").split(",")
     if m.strip())
 
 def detect_episodes(series_clean, confidence=None):
@@ -2233,8 +2278,8 @@ def weathercode_icon(code):
 
 # ── Comparación con referencia regional CAMS (Copernicus) ───────────────────
 # Mapeo metrica del sensor -> variable equivalente en la API de Open-Meteo AQ.
-SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "no2": "nitrogen_dioxide",
-            "o3": "ozone"}
+SAT_VARS = {"pm25": "pm2_5", "pm10": "pm10", "so2": "sulphur_dioxide",
+            "no2": "nitrogen_dioxide", "o3": "ozone"}
 _sat_cache = {}
 
 def fetch_reference(geo3, hours):
@@ -2345,6 +2390,11 @@ CONF_BIAS_FAIR  = float(os.getenv("CONF_BIAS_FAIR", "50"))   # |sesgo%| <= -> ok
 # 'dudoso': sigue sirviendo para tendencias y alertas, pero su valor absoluto
 # necesita el factor de correccion antes de darlo por bueno.
 CONF_BIAS_BAD   = float(os.getenv("CONF_BIAS_BAD", "300"))   # |sesgo%| > -> malo
+# Sobrelectura: un factor > 5 significa que el sensor lee menos del 20% de lo
+# real (sesgo < -80%). Antes la regla solo castigaba sesgo > +300%, así que un
+# nodo que leía 1/18 de lo real pasaba como "dudoso" y entraba en alertas.
+# Issue #3.
+SOBRELECTURA_FACTOR = float(os.getenv("SOBRELECTURA_FACTOR", "5.0"))
 CONF_MIN_N      = int(os.getenv("CONF_MIN_N", "12"))         # pares minimos
 
 # Correccion de PM: los sensores opticos baratos subestiman de forma
@@ -2679,6 +2729,38 @@ def fetch_series_by_sensor(geo3, hours):
 
 CROSS_MIN_SENSORS = int(os.getenv("CROSS_MIN_SENSORS", "3"))
 CROSS_MIN_N = int(os.getenv("CROSS_MIN_N", "12"))
+# Distancia máxima entre sensores para el consenso local (issue #9).
+# geo3 = 3 chars ≈ 156 km; nodos a 20 km no miden el mismo aire.
+CROSS_MAX_KM = float(os.getenv("CROSS_MAX_KM", "5.0"))
+
+def _sensor_distance(mac_a, mac_b):
+    """Distancia haversine entre dos sensores por su posición geo (7 chars)."""
+    try:
+        c = influx_client()
+        positions = {}
+        for mac in (mac_a, mac_b):
+            q = (f'SELECT last("geo") AS geo FROM "{MEASUREMENT}" '
+                 f'WHERE "mac" = \'{mac}\' AND time > now() - 48h')
+            res = c.query(q)
+            for (_m, _t), pts in res.items():
+                p0 = next(iter(pts), {})
+                g = p0.get("geo")
+                if g:
+                    try:
+                        positions[mac] = geohash_center(g)
+                    except Exception:
+                        pass
+        c.close()
+        if mac_a not in positions or mac_b not in positions:
+            return None
+        (la1, lo1), (la2, lo2) = positions[mac_a], positions[mac_b]
+        R = 6371.0
+        dla, dlo = math.radians(la2 - la1), math.radians(lo2 - lo1)
+        a = math.sin(dla/2)**2 + math.cos(math.radians(la1)) * math.cos(math.radians(la2)) * math.sin(dlo/2)**2
+        return 2 * R * math.asin(math.sqrt(a))
+    except Exception:
+        return None
+
 
 def cross_sensor_validation(geo3, hours):
     """
@@ -2709,7 +2791,8 @@ def cross_sensor_validation(geo3, hours):
             pairs = []
             for h, v in mine.items():
                 others = [data[o][m][h] for o in macs
-                          if o != mac and h in data[o][m]]
+                          if o != mac and h in data[o][m]
+                          and _sensor_distance(mac, o) <= CROSS_MAX_KM]
                 if len(others) >= 2:      # consenso necesita >=2 vecinos
                     pairs.append((v, float(np.median(others))))
             if len(pairs) < CROSS_MIN_N:
@@ -2942,7 +3025,7 @@ EPISODE_MIN_HOURS = int(os.getenv("EPISODE_MIN_HOURS", "2"))  # min duración
 # "episodios sostenidos de humedad" que no dicen nada de la calidad del aire.
 # La temperatura queda fuera por el mismo motivo (es contexto, no episodio).
 EPISODE_METRICS = set(m.strip() for m in os.getenv(
-    "EPISODE_METRICS", "pm25,pm10,pm1,no2,o3,nh3,co,co2,so2,db").split(",")
+    "EPISODE_METRICS", "pm25,pm10,pm4,so2,no2,o3,nh3,co,co2,db").split(",")
     if m.strip())
 
 def detect_episodes(series_clean, confidence=None):
@@ -4046,6 +4129,88 @@ def collect_sensors():
     return rows
 
 
+def _sensor_last_time(mac):
+    """Última lectura de un sensor en ISO UTC, o None."""
+    try:
+        c = influx_client()
+        q = (f'SELECT last("pm25") AS v FROM "{MEASUREMENT}" '
+             f'WHERE "mac" = \'{mac}\' AND time > now() - {SENSORS_ACTIVE_HOURS * 24}h')
+        res = c.query(q, epoch="s")
+        for (_m, _t), pts in res.items():
+            p0 = next(iter(pts), {})
+            if p0.get("time"):
+                return datetime.fromtimestamp(int(p0["time"]), tz=timezone.utc).isoformat()
+        c.close()
+    except Exception:
+        pass
+    return None
+
+
+def _read_metrics_conf(p):
+    """{metrica: {rho, bias_pct, n}} desde la BD de análisis."""
+    try:
+        c = analysis_db_client()
+        q = (f'SELECT last("pm25_rho") AS rho25, last("pm10_rho") AS rho10, '
+             f'last("no2_rho") AS rho_no2, last("o3_rho") AS rho_o3, '
+             f'last("pm25_bias") AS b25, last("pm10_bias") AS b10, '
+             f'last("no2_bias") AS b_no2, last("o3_bias") AS b_o3, '
+             f'last("pm25_n") AS n25, last("pm10_n") AS n10, '
+             f'last("no2_n") AS n_no2, last("o3_n") AS n_o3 '
+             f'FROM "{ANALYSIS_MEAS}" WHERE time > now() - 6h '
+             f'GROUP BY "geo3"')
+        out = {}
+        for (_m, tags), pts in c.query(q).items():
+            if not tags or not tags.get("geo3"):
+                continue
+            g = tags["geo3"]
+            p0 = next(iter(pts), {})
+            entry = {}
+            for metric, rkc, bkc, nkc in (
+                ("pm25", "rho25", "b25", "n25"),
+                ("pm10", "rho10", "b10", "n10"),
+                ("no2", "rho_no2", "b_no2", "n_no2"),
+                ("o3", "rho_o3", "b_o3", "n_o3"),
+            ):
+                rho = p0.get(rkc); bias = p0.get(bkc); nn = p0.get(nkc)
+                if rho is not None or bias is not None or nn is not None:
+                    entry[metric] = {"rho": rho, "bias_pct": bias, "n": nn}
+            if entry:
+                out[g] = entry
+        c.close()
+        return out
+    except Exception as e:
+        log.warning("metrics_conf no disponible: %s", e)
+        return {}
+
+
+def _load_ref_history(days):
+    """{geo3: {epoch_s: {pm25, source, n}}} desde ref_history."""
+    out = {}
+    try:
+        c = _esod_db()
+        w = f'WHERE time > now() - {days}d AND "metric" = \'pm25\''
+        res = c.query(f'SELECT mean("v") AS v FROM "ref_history" {w} '
+                      f'GROUP BY "geo3", "provider", time(1h) fill(none)')
+        for (_m, tags), pts in res.items():
+            if not tags or not tags.get("geo3"):
+                continue
+            g = tags["geo3"]
+            prov = tags.get("provider") or "oficial"
+            for p in pts:
+                t = int(p["time"])
+                v = p.get("v")
+                if v is None:
+                    continue
+                entry = out.setdefault(g, {}).setdefault(t, {})
+                entry["pm25"] = round(float(v), 2)
+                entry["source"] = prov
+                entry["n"] = entry.get("n", 0) + 1
+        c.close()
+    except Exception as e:
+        log.warning("ref_history no disponible: %s", e)
+    return out
+
+
 def publish_site():
     """Recopila estado actual + histórico de la BD analysis y publica a Pages."""
     try:
@@ -4080,7 +4245,7 @@ def publish_site():
             zones.append({
                 "geo3": tags.get("geo3"),
                 "status": st_name.get(int(p.get("sc") or 0), "?"),
-                "aqi": int(p.get("aqi") or 0),
+                "aqi": p.get("aqi"),   # None si no hay dato: 0 es "aire óptimo" (issue #2)
                 "pm25": p.get("pm25"), "noise_db": p.get("db"),
                 "no2": p.get("no2"), "wind_kmh": p.get("wind"),
                 "wind_dir_txt": p.get("wdir"),
@@ -4099,10 +4264,19 @@ def publish_site():
                 "prediction": p.get("pred") or "",
                 "confidence": {"pm25": cf("pm25c"), "pm10": cf("pm10c"),
                                "no2": cf("no2c"), "o3": cf("o3c")},
+                # rho / sesgo / n por métrica: la web ya los lee, pero el
+                # backend no los publicaba. Issue #5.
+                "metrics_conf": _read_metrics_conf(p),
                 "pm25_corr_factor": p.get("pm25f"),
                 # referencia usada para validar: euskadi | openaq | cams
                 "ref_source": p.get("refsrc") or "cams",
                 "ref_stations": p.get("refsts") or "",
+                # Declarar qué ventana representa cada número (issue #6)
+                "windows": {
+                    "pm25": "último punto de la BD (1h)",
+                    "caqi_pm25": "media 24h (CAQI)",
+                    "noise_db": "último punto de la BD (1h)",
+                },
             })
         # histórico para timeline/gráficas: series por hora por zona
         hist = c.query(
@@ -4110,16 +4284,25 @@ def publish_site():
             f'mean("db_last") AS noise_db, mean("status_code") AS status '
             f'FROM "{ANALYSIS_MEAS}" WHERE time > now() - {publisher.HISTORY_DAYS}d '
             f'GROUP BY "geo3", time(1h) fill(none)')
+        # Serie de referencia oficial por zona (issue #4)
+        ref_hist = _load_ref_history(publisher.HISTORY_DAYS)
         points = []
         for (mname, tags), pts in hist.items():
             if not tags:
                 continue
             g = tags.get("geo3")
             for p in pts:
-                points.append({"geo3": g, "t": p["time"],
-                               "aqi": _r(p.get("aqi")), "pm25": _r(p.get("pm25")),
-                               "noise_db": _r(p.get("noise_db")),
-                               "status": _r(p.get("status"))})
+                pt = {"geo3": g, "t": p["time"],
+                      "aqi": _r(p.get("aqi")), "pm25": _r(p.get("pm25")),
+                      "noise_db": _r(p.get("noise_db")),
+                      "status": _r(p.get("status"))}
+                # Añadir referencia si existe para esta zona y hora
+                ref_entry = ref_hist.get(g, {}).get(p["time"])
+                if ref_entry:
+                    pt["ref_pm25"] = ref_entry.get("pm25")
+                    pt["ref_source"] = ref_entry.get("source", "oficial")
+                    pt["ref_n"] = ref_entry.get("n", 0)
+                points.append(pt)
         c.close()
         # análisis individual por sensor dentro de cada zona
         nombres = _sensor_names()
@@ -4159,6 +4342,7 @@ def publish_site():
                     # (ej. NH3 leyendo 1520 µg/m³, fuera del rango 0-400)
                     "discarded_metrics": r.get("discarded_metrics"),
                     "points": s["points"],
+                    "last_time": _sensor_last_time(s["mac"]),
                 })
             z["sensors"] = sens_list
             # notas de zona: consenso entre sensores, rosa, CAQI, episodios y corr. ambiental
