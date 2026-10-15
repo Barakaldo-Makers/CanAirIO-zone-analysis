@@ -3,6 +3,56 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 Versionado semántico.
 
+## [1.3.0] — 2026-10-15
+
+### Añadido
+- **`acustica.py`: indicadores acústicos de largo plazo.** Lee los Ld/Le/Ln/Lden
+  y el L90 que ya publican los nodos —no los recalcula— y los contrasta con el
+  RD 1367/2007 (objetivos por periodo y tipo de área) y con la guía de la OMS
+  2018 (Lden y Lnight). Autodetecta el nombre de los campos en InfluxDB en vez
+  de darlo por supuesto. Endpoint `/acustica[/<geo3>]`.
+  El L90 sirve para separar dos cosas que el Lden no distingue: si los nodos
+  concuerdan en el ruido de FONDO y discrepan en Lden, están bien calibrados y
+  miden calles distintas; si discrepan ya en el fondo, es calibración o
+  emplazamiento. Los veredictos se publican como ORIENTATIVOS: el RD se refiere
+  a valores anuales y una evaluación formal exige el procedimiento de la
+  ISO 1996-2 con equipo calibrado.
+- **`narrador.py`: redacción en castellano vía API remota** (cualquier endpoint
+  compatible con OpenAI). El modelo no calcula: recibe las cifras hechas y solo
+  las redacta. Después se extrae **cada número** del texto y se comprueba que
+  esté en los datos de entrada; si aparece una cifra inventada, el texto se
+  descarta y el sistema sigue con el motor de reglas. Apagado por defecto
+  (`NARRA_ENABLE=0`): sin activarlo no se llama a ninguna API.
+  Endpoint `/narrativa/<geo3>`.
+- Endpoints `/ref-history[/<geo3>]`, que se quedó sin portar en la 1.2.0.
+
+### Corregido
+- **El cotejo entre sensores medía el ruido en porcentaje.** `bias_pct` es
+  `100·(sensor−consenso)/consenso`, y eso no significa nada en una escala
+  logarítmica con cero arbitrario. Con los umbrales de concentración
+  (150 % dudoso, 300 % divergente) y un consenso de 40 dB, salir `divergente`
+  exigía una diferencia de 120 dB: leer 160 dB, por encima del rango físico.
+  **Ningún nodo de ruido podía marcarse como divergente.** Y la rho de Spearman
+  es ciega a un desplazamiento constante: el mismo patrón diario desplazado
+  42 dB da rho = 1,000 exacto, que es justo el fallo típico de un micrófono.
+  Ahora `LOG_METRICS` desvía esas métricas a umbrales acústicos: ≤3 dB
+  coherente (3 dB es un doblaje de energía; 1,5 dB la tolerancia de un
+  sonómetro de clase 2), >6 dB divergente, y el sesgo se reporta en dB.
+  En el despliegue real, cuatro nodos que salían `coherente` con 13–27 dB de
+  discrepancia pasaron a `divergente`.
+- **`ai-bridge/app.py` tenía 1165 líneas duplicadas verbatim.** Un bloque
+  contiguo de 32 funciones —`clean_series`, `detect_alerts`,
+  `cross_sensor_validation`, `pm_corrections`, `detect_episodes`…— aparecía dos
+  veces, desde el commit `b184175`. Las dos copias eran idénticas, así que no
+  había fallo de comportamiento (en Python gana la última definición), pero era
+  un tercio del fichero y una trampa: quien editara la primera copia no vería
+  ningún efecto. Verificado antes de limpiar que las dos regiones eran iguales
+  línea a línea, y después que las 97 funciones efectivas, las 27 rutas y las
+  79 constantes son byte a byte las de antes.
+- `.gitignore` vuelve a excluir `*.code-workspace` y `parche-*.sh`: las reglas
+  se perdieron en un merge y por eso se colaron al repo un script de parche con
+  payload embebido y el workspace del editor.
+
 ## [1.2.0] — 2026-09-24
 
 ### Añadido
