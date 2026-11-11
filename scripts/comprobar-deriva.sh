@@ -75,6 +75,8 @@ for g, info in sorted(z.items()):
                 k, v.get("status"), v.get("baseline_factor"),
                 v.get("recent_factor"), v.get("change_pct", 0),
                 v.get("days_out_of_band"), v.get("window"), v.get("band")))
+        if v.get("estimador"):
+            print("            estimador: %s" % v["estimador"])
         for l in textwrap.wrap(v.get("note", ""), 76):
             print("            " + l)
         cb = v.get("cobertura")

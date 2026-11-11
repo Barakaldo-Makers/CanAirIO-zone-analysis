@@ -3,6 +3,45 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 Versionado semántico.
 
+## [1.4.0] — 2026-11-11
+
+### Corregido
+- **El factor de corrección de PM era un cociente de dos medias.**
+  `reference_mean / sensor_mean` usaba las ~46 parejas horarias de la ventana
+  para calcular dos números y dividirlos; con niveles de ~5 µg/m³ el factor
+  diario invertía el signo en cuatro días (+23,5 % → −17,5 % en `ezt`) y la
+  banda del detector de deriva salía 42 veces más ancha que el propio factor,
+  porque medía el ruido del estimador. Ahora el factor es la **mediana de los
+  cocientes horarios** referencia/sensor, con IC 95 % por estadísticos de
+  orden: medido por simulación, empata con el cociente de medias con ruido
+  limpio y tiene 2,3–2,7 veces menos ruido —y ningún sesgo— cuando hay
+  episodios locales, que es cuando el cociente además se sesgaba a corregir de
+  menos. Detalle y cifras en
+  [`docs/VALIDACION.md`](docs/VALIDACION.md#9-el-factor-de-correccion-era-un-cociente-de-dos-medias).
+  El estimador nuevo se guarda en su propio campo (`pm_factor_med_<m>`, con IC
+  en `pm_fci_lo/hi_<m>`): cambiarlo dentro de `pm_factor_<m>` habría mezclado
+  dos definiciones en una serie, igual que antes se mezclaban dos bases. El
+  detector de deriva juzga la serie nueva cuando acumula `DRIFT_MIN_DAYS`
+  días y hasta entonces sigue con la antigua, anunciándolo en `estimador`.
+  Un día con IC más ancho que `PM_FACTOR_CI_MAX` se publica como `incierto`.
+
+### Añadido
+- **`en_el_limite` en los veredictos acústicos.** Un nodo real pasó de
+  `no_saludable` (Lden 53,6) a `saludable` (52,5) en cuatro días con un cambio
+  de 1,1 dB: a esa distancia del umbral, los dos veredictos eran igual de
+  indefendibles. A menos de `ACU_LIMITE_DB` (2 dB por defecto; la tolerancia
+  de un sonómetro de clase 2 ya es ±1,5 dB y estos nodos no llegan) del
+  objetivo del RD 1367/2007 o de la recomendación OMS, el estado es
+  `en_el_limite` y la nota dice que decidirlo exige una medición ISO 1996-2.
+  Un exceso claro en un periodo sigue dominando sobre otro en la franja.
+- **Emergencia Lden−L90 por nodo** en el diagnóstico acústico. Un error de
+  ganancia desplaza Lden y L90 por igual y se **cancela en la resta**, así que
+  es la única magnitud comparable entre nodos sin calibrador. En el despliegue
+  real los Lden abarcaban 23,3 dB entre nodos y las emergencias solo 6,6 dB:
+  buena parte de aquel recorrido era calibración, no calle. No se publica
+  cuando el L90 es de firmware (`l90_no_utilizable`), porque entonces la resta
+  es tan falsa como él.
+
 ## [1.3.0] — 2026-10-15
 
 ### Añadido

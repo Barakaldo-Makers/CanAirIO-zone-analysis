@@ -723,9 +723,17 @@ def detect_factor_drift(geo3):
         # historial viejo no lo tiene
         hay_pairs = {m for m in quiero
                      if not campos or f"pm_pairs_{m}" in campos}
+        # el estimador nuevo (mediana de cocientes horarios) vive en su propio
+        # campo: el historial de pm_factor_<m> esta escrito con el cociente de
+        # medias y cambiarle la definicion habria mezclado dos estimadores en
+        # una serie, igual que antes se mezclaban dos bases
+        hay_med = {m for m in quiero
+                   if not campos or f"pm_factor_med_{m}" in campos}
         trozos = [f'MEDIAN("pm_factor_{m}") AS "{m}"' for m in quiero]
         trozos += [f'MEDIAN("pm_pairs_{m}") AS "{m}__pairs"'
                    for m in sorted(hay_pairs)]
+        trozos += [f'MEDIAN("pm_factor_med_{m}") AS "{m}__med"'
+                   for m in sorted(hay_med)]
         sel = ", ".join(trozos)
         # GROUP BY "basis": sin separar por base, la mediana diaria mezclaba el
         # factor derivado de CAMS con el derivado de la cabina y no significaba
@@ -766,10 +774,33 @@ def detect_factor_drift(geo3):
         return None
     out = {}
     for m in quiero:
-        crudo = [(float(p[m]),
-                  float(p.get(f"{m}__pairs") or 0) or None)
-                 for p in filas
-                 if p.get(m) is not None and p[m] == p[m]]
+        # dos series por metrica: la antigua (cociente de medias) y la nueva
+        # (mediana de cocientes horarios), NUNCA mezcladas: cambiar de
+        # estimador dentro de una misma serie seria repetir el error de la
+        # mezcla de bases. Se juzga la nueva en cuanto acumula historial
+        # suficiente; hasta entonces se sigue juzgando la antigua.
+        crudo_old = [(float(p[m]),
+                      float(p.get(f"{m}__pairs") or 0) or None)
+                     for p in filas
+                     if p.get(m) is not None and p[m] == p[m]]
+        kmed = f"{m}__med"
+        crudo_med = [(float(p[kmed]),
+                      float(p.get(f"{m}__pairs") or 0) or None)
+                     for p in filas
+                     if p.get(kmed) is not None and p[kmed] == p[kmed]]
+        if len(crudo_med) >= DRIFT_MIN_DAYS:
+            crudo = crudo_med
+            estimador = "mediana_ratios_horarios"
+            nota_estimador = None
+        else:
+            crudo = crudo_old
+            estimador = "cociente_de_medias"
+            nota_estimador = (
+                (" El estimador nuevo (mediana de cocientes horarios) lleva "
+                 "%d de %d días; cuando llegue, el detector se pasará a él y "
+                 "la banda dejará de medir el ruido del cociente de medias."
+                 % (len(crudo_med), DRIFT_MIN_DAYS))
+                if crudo_med else None)
         cobertura = {}
         con_pairs = [(f, pr) for f, pr in crudo if pr]
         if con_pairs:
@@ -828,15 +859,18 @@ def detect_factor_drift(geo3):
         if n < DRIFT_MIN_DAYS:
             out[m] = {"status": "sin_historial_suficiente", "days": n,
                       "days_needed": DRIFT_MIN_DAYS,
+                      "estimador": estimador,
                       **({"cobertura": cobertura} if cobertura else {}),
                       "note": (f"{n} de {DRIFT_MIN_DAYS} días de historial de "
-                               f"factor. Aún no se puede hablar de deriva.")}
+                               f"factor. Aún no se puede hablar de deriva."
+                               + (nota_estimador or ""))}
             continue
         base = np.array(serie[:-DRIFT_W], dtype=float)
         rec = np.array(serie[-DRIFT_W:], dtype=float)
         if len(base) < 3:
             out[m] = {"status": "sin_historial_suficiente", "days": n,
                       "days_needed": DRIFT_W + 3,
+                      "estimador": estimador,
                       "note": "el historial no cubre base y ventana reciente."}
             continue
         med = float(np.median(base))
@@ -852,6 +886,7 @@ def detect_factor_drift(geo3):
         d = {
             "status": "deriva" if detectada else "estable",
             "detected": detectada,
+            "estimador": estimador,
             "days": n,
             "baseline_days": int(len(base)),
             "baseline_factor": round(med, 3),
@@ -893,6 +928,8 @@ def detect_factor_drift(geo3):
                 d["note"] = (f"factor estable en x{rec_med:.3f}; {fuera} de los "
                              f"últimos {DRIFT_W} días fuera de banda (hacen "
                              f"falta {DRIFT_ALPHA}).")
+        if nota_estimador:
+            d["note"] = d.get("note", "") + nota_estimador
         if cobertura:
             d["cobertura"] = cobertura
         out[m] = d
@@ -1274,6 +1311,27 @@ def compare_with_reference(series_clean, reference):
             "bias": round(bias, 2),
             "bias_pct": round(rel, 1) if rel is not None else None,
         }
+        # Factor robusto para las metricas de PM: mediana de los cocientes
+        # horarios referencia/sensor, con IC 95 % por estadisticos de orden.
+        # Se calcula AQUI porque es el unico sitio donde las parejas estan a
+        # mano: pm_corrections() solo recibe este resumen, y el cociente de
+        # medias que usaba tiraba las ~46 parejas para quedarse con dos
+        # numeros. Solo horas con sensor > 0: un cociente con denominador 0
+        # no es un dato, y la mediana no se inmuta por excluirlas.
+        if m in PM_CORRECTION_METRICS:
+            ok = (sv > 0) & (rv >= 0)
+            ratios = np.sort(rv[ok] / sv[ok])
+            nr = int(ratios.size)
+            results[m]["ratios_n"] = nr
+            results[m]["ratios_descartados"] = int(len(pairs) - nr)
+            if nr >= PM_FACTOR_MIN_RATIOS:
+                fmed = float(np.median(ratios))
+                # IC 95 % de una mediana, libre de distribucion: rangos
+                # n/2 -+ 1.96*sqrt(n)/2 de la muestra ordenada
+                k = max(int((nr - 1.96 * math.sqrt(nr)) // 2), 0)
+                results[m]["factor_mediana"] = round(fmed, 3)
+                results[m]["factor_ci95"] = [round(float(ratios[k]), 3),
+                                             round(float(ratios[nr - 1 - k]), 3)]
     # AOD no tiene equivalente directo en el sensor; lo reportamos como contexto
     if reference.get("aod"):
         vals = list(reference["aod"].values())
@@ -1328,6 +1386,19 @@ PM_CORRECTION_METRICS = set(
     if x.strip())
 # solo corrige si la correlacion es al menos razonable (si no, no tiene sentido)
 PM_CORRECTION_MIN_RHO = float(os.getenv("PM_CORRECTION_MIN_RHO", "0.5"))
+
+# Estimador del factor (desde 1.4.0): mediana de los cocientes horarios
+# referencia/sensor, en vez del cociente de las dos medias. El cociente de
+# medias usaba ~46 parejas horarias para calcular dos numeros y dividirlos, y
+# un cociente de dos medias pequenas tiene una varianza relativa enorme: en el
+# despliegue real el factor diario de pm10 paso de +23,5 % a -17,5 % en cuatro
+# dias sin que cambiara nada fisico, y la banda del detector de deriva salia
+# 42 veces mas ancha que el propio factor. La mediana de cocientes usa cada
+# hora emparejada y trae su incertidumbre de serie (IC 95 % por estadisticos
+# de orden, sin supuestos de distribucion).
+PM_FACTOR_MIN_RATIOS = int(os.getenv("PM_FACTOR_MIN_RATIOS", "12"))
+# si IC95_sup / IC95_inf supera esto, el factor del dia se marca 'incierto'
+PM_FACTOR_CI_MAX = float(os.getenv("PM_FACTOR_CI_MAX", "1.5"))
 
 # Zonas con referencia oficial. Vacío (por defecto) = AUTOMÁTICO: se intenta en
 # todas las zonas y cada fuente decide si cubre esa posición.
@@ -1522,9 +1593,17 @@ def merge_confidence(cams_conf, official_conf, official_source="oficial"):
 
 def pm_corrections(comp, basis="CAMS"):
     """
-    Factor de correccion por metrica de PM:
-    factor = reference_mean / sensor_mean (acerca el sensor a la referencia).
+    Factor de correccion por metrica de PM (acerca el sensor a la referencia).
     Solo para metricas configuradas y con correlacion suficiente.
+
+    Estimador (desde 1.4.0): la MEDIANA de los cocientes horarios ref/sensor
+    que calcula compare_with_reference(), con su IC 95 %. El estimador antiguo
+    —reference_mean / sensor_mean— usaba las ~46 parejas horarias para
+    calcular dos numeros y dividirlos, y con niveles de PM de ~5 ug/m3 ese
+    cociente de medias oscilaba sin que cambiara nada fisico: +23,5 % un dia,
+    -17,5 % cuatro dias despues, y la banda del detector de deriva salia 42
+    veces mas ancha que el factor. Se sigue publicando como 'factor_medias'
+    para poder comparar y para no romper la serie historica.
 
     'basis' dice contra que referencia se calculo. Importa: con CAMS salia
     factor 0,664 para PM2.5 (reduciendo un sensor que YA subestima un 19%),
@@ -1541,13 +1620,44 @@ def pm_corrections(comp, basis="CAMS"):
         if c["spearman_rho"] < PM_CORRECTION_MIN_RHO:
             continue
         sm = c.get("sensor_mean"); rm = c.get("reference_mean")
-        if sm and rm and sm > 0:
-            out[m] = {"factor": round(rm / sm, 3),
-                      # horas emparejadas con que se calculo: un dia con 6
-                      # horas no deberia pesar igual que uno con 24, y hay que
-                      # guardarlo para poder COMPROBAR si el ruido del factor
-                      # se concentra en los dias de poca cobertura
+        f_medias = round(rm / sm, 3) if (sm and rm and sm > 0) else None
+        f_med = c.get("factor_mediana")
+        if f_med is None and f_medias is None:
+            continue
+        if f_med is not None:
+            entry = {"factor": f_med,
+                     "metodo": "mediana_ratios_horarios",
+                     "ci95": c.get("factor_ci95"),
+                     # el estimador antiguo, para comparar los dos y para que
+                     # la serie historica pm_factor_<m> no cambie de definicion
+                     "factor_medias": f_medias,
+                     # horas emparejadas con que se calculo: un dia con 6
+                     # horas no deberia pesar igual que uno con 24, y hay que
+                     # guardarlo para poder COMPROBAR si el ruido del factor
+                     # se concentra en los dias de poca cobertura
+                     "pairs": int(c.get("n") or 0),
+                     "ratios_n": c.get("ratios_n"),
+                     "basis": f"mediana(ref/sensor por hora) vs {basis}"}
+            ci = c.get("factor_ci95") or []
+            if (len(ci) == 2 and ci[0] and ci[0] > 0
+                    and ci[1] / ci[0] > PM_FACTOR_CI_MAX):
+                entry["incierto"] = True
+                entry["nota"] = (
+                    "IC95 [%s, %s]: el factor de esta ventana se conoce mal "
+                    "(anchura x%.2f, umbral x%g). Se publica y se aplica "
+                    "igual, pero no apoyes decisiones en el valor corregido "
+                    "de hoy." % (ci[0], ci[1], ci[1] / ci[0],
+                                 PM_FACTOR_CI_MAX))
+            out[m] = entry
+        else:
+            out[m] = {"factor": f_medias,
+                      "metodo": "cociente_de_medias",
+                      "factor_medias": f_medias,
                       "pairs": int(c.get("n") or 0),
+                      "nota": ("menos de %d cocientes horarios validos: se usa "
+                               "el estimador antiguo (cociente de medias), que "
+                               "con pocos datos es aun menos fiable."
+                               % PM_FACTOR_MIN_RATIOS),
                       "basis": f"reference_mean/sensor_mean vs {basis}"}
     return out
 
@@ -2126,6 +2236,18 @@ def _save_pm_factor_history(geo3, pm_corrections_data, basis="desconocida"):
     distinguirlas, la mediana diaria mezclaba las dos bases —para pm25 de la
     zona ezt, ~0,664 de CAMS con ~1,233 de la cabina— y el resultado no
     significaba nada: ni el valor ni su variabilidad.
+
+    Campos (desde 1.4.0, la misma lección aplicada al ESTIMADOR):
+      pm_factor_<m>      cociente de medias, SIEMPRE. Es la definición con la
+                         que se escribió todo el historial, así que cambiarla
+                         en el mismo campo habría mezclado dos estimadores en
+                         una serie, igual que antes se mezclaban dos bases.
+      pm_factor_med_<m>  mediana de cocientes horarios (el estimador nuevo).
+                         El detector de deriva se pasa a esta serie cuando
+                         acumula DRIFT_MIN_DAYS días; hasta entonces sigue
+                         juzgando la antigua.
+      pm_fci_lo/hi_<m>   IC 95 % del estimador nuevo.
+      pm_pairs_<m>       horas emparejadas de la ventana.
     """
     if not pm_corrections_data:
         return
@@ -2134,11 +2256,22 @@ def _save_pm_factor_history(geo3, pm_corrections_data, basis="desconocida"):
         c.switch_database(ANALYSIS_DB)
         fields = {}
         for m, info in pm_corrections_data.items():
-            f = (info or {}).get("factor")
-            if f is not None:
-                fields[f"pm_factor_{m}"] = float(f)
+            info = info or {}
+            # la serie antigua conserva su definicion: cociente de medias
+            f_old = info.get("factor_medias")
+            if f_old is None and info.get("metodo") != "mediana_ratios_horarios":
+                f_old = info.get("factor")
+            if f_old is not None:
+                fields[f"pm_factor_{m}"] = float(f_old)
+            if info.get("metodo") == "mediana_ratios_horarios":
+                fields[f"pm_factor_med_{m}"] = float(info["factor"])
+                ci = info.get("ci95") or []
+                if len(ci) == 2 and ci[0] is not None and ci[1] is not None:
+                    fields[f"pm_fci_lo_{m}"] = float(ci[0])
+                    fields[f"pm_fci_hi_{m}"] = float(ci[1])
+            if f_old is not None or f"pm_factor_med_{m}" in fields:
                 # cobertura del dia, para poder ponderar o filtrar despues
-                pr = (info or {}).get("pairs")
+                pr = info.get("pairs")
                 if pr:
                     fields[f"pm_pairs_{m}"] = float(pr)
         if fields:

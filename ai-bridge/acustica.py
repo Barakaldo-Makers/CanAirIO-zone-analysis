@@ -24,7 +24,11 @@ NO CALCULA LOS ÍNDICES. Los nodos ya los publican, así que este módulo:
   1. descubre con qué nombre están los campos en InfluxDB (no se adivinan),
   2. los resume por nodo sobre la ventana de análisis,
   3. coteja los nodos entre sí EN DECIBELIOS, no en porcentaje,
-  4. emite dos veredictos separados: el legal y el de salud.
+  4. emite dos veredictos separados: el legal y el de salud, con una franja de
+     indecisión ('en_el_limite') de ±ACU_LIMITE_DB alrededor de cada límite,
+  5. publica la emergencia Lden−L90 por nodo: un desfase de calibración
+     desplaza los dos niveles por igual y se cancela en la resta, así que es
+     lo único comparable entre nodos mientras no haya calibrador.
 
 Por qué en decibelios: el cotejo genérico de app.py mide el sesgo como
 porcentaje del nivel medio, y eso no significa nada en una escala logarítmica
@@ -77,6 +81,14 @@ ACU_DIV_DB = float(os.getenv("ACU_DIV_DB", "6.0"))   # >  esto, divergente
 
 # Recorrido máximo entre nodos para atreverse a dar un valor de zona.
 ACU_MAX_SPREAD_DB = float(os.getenv("ACU_MAX_SPREAD_DB", "6.0"))
+
+# Franja de indecisión alrededor de cada límite normativo, en dB. Un veredicto
+# binario a menos de esto del límite no es información con esta clase de
+# sensor: en el despliegue real un nodo pasó de 'no_saludable' (Lden 53,6) a
+# 'saludable' (52,5) en cuatro días con un cambio de 1,1 dB, y los dos
+# veredictos eran igual de indefendibles. La tolerancia de un sonómetro de
+# clase 2 ya es ±1,5 dB y estos nodos no llegan a clase 2.
+ACU_LIMITE_DB = float(os.getenv("ACU_LIMITE_DB", "2.0"))
 
 # Mínimo de muestras por nodo e indicador para tenerlo en cuenta.
 ACU_MIN_N = int(os.getenv("ACU_MIN_N", "6"))
@@ -330,6 +342,7 @@ def veredicto_rd(res, geo3):
     detalle = {}
     faltan = []
     excesos = []
+    bordes = []
     for ind in ("ld", "le", "ln"):
         lim = obj[ind]
         r = (res or {}).get(ind)
@@ -339,11 +352,15 @@ def veredicto_rd(res, geo3):
             continue
         v = r["valor"]
         exceso = round(v - lim, 1)
+        en_lim = bool(abs(v - lim) <= ACU_LIMITE_DB)
         detalle[ind] = {"valor": v, "objetivo_dba": lim,
                         "exceso_db": exceso,
-                        "dentro": bool(v <= lim)}
-        if exceso > 0:
+                        "dentro": bool(v <= lim),
+                        "en_limite": en_lim}
+        if exceso > ACU_LIMITE_DB:
             excesos.append((ind, exceso))
+        elif en_lim:
+            bordes.append((ind, exceso))
     if faltan:
         return {"norma": "RD 1367/2007 Anexo II Tabla A",
                 "area_acustica": area, "area_desc": obj["desc"],
@@ -352,16 +369,28 @@ def veredicto_rd(res, geo3):
                 "nota": ("faltan " + ", ".join(ETIQUETAS[i] for i in faltan)
                          + ": el RD fija objetivos por periodo, así que sin los "
                            "tres no hay contraste posible.")}
-    if not excesos:
-        nota = (f"los tres periodos quedan dentro del objetivo de área tipo "
-                f"'{area}' ({obj['desc']}): {obj['ld']}/{obj['le']}/{obj['ln']} dBA.")
-        estado = "dentro_del_objetivo"
-    else:
+    if excesos:
         peor = max(excesos, key=lambda x: x[1])
         estado = "fuera_del_objetivo"
         nota = ("supera el objetivo en "
                 + ", ".join(f"{ETIQUETAS[i]} +{e} dB" for i, e in excesos)
                 + f". El exceso mayor es {ETIQUETAS[peor[0]]}, +{peor[1]} dB.")
+        if bordes:
+            nota += (" Además, "
+                     + ", ".join(f"{ETIQUETAS[i]} ({e:+} dB)" for i, e in bordes)
+                     + " queda en la franja de indecisión.")
+    elif bordes:
+        estado = "en_el_limite"
+        nota = (", ".join(f"{ETIQUETAS[i]} ({e:+} dB)" for i, e in bordes)
+                + f" queda a menos de {ACU_LIMITE_DB:g} dB del objetivo: con un "
+                f"sensor de esta clase el veredicto binario no es decidible, y "
+                f"haría falta una medición ISO 1996-2 para afirmarlo en "
+                f"cualquiera de los dos sentidos.")
+    else:
+        nota = (f"los tres periodos quedan dentro del objetivo de área tipo "
+                f"'{area}' ({obj['desc']}): {obj['ld']}/{obj['le']}/{obj['ln']} "
+                f"dBA, con más de {ACU_LIMITE_DB:g} dB de margen.")
+        estado = "dentro_del_objetivo"
     return {"norma": "RD 1367/2007 Anexo II Tabla A",
             "area_acustica": area, "area_desc": obj["desc"],
             "objetivos_dba": {k: obj[k] for k in ("ld", "le", "ln")},
@@ -378,6 +407,7 @@ def veredicto_oms(res):
     det = {}
     faltan = []
     excesos = []
+    bordes = []
     for ind, lim in (("lden", g["lden"]), ("ln", g["ln"])):
         if lim is None:
             continue
@@ -388,10 +418,14 @@ def veredicto_oms(res):
             continue
         v = r["valor"]
         exceso = round(v - lim, 1)
+        en_lim = bool(abs(v - lim) <= ACU_LIMITE_DB)
         det[ind] = {"valor": v, "recomendado_db": lim,
-                    "exceso_db": exceso, "dentro": bool(v < lim)}
-        if exceso >= 0:
+                    "exceso_db": exceso, "dentro": bool(v < lim),
+                    "en_limite": en_lim}
+        if exceso > ACU_LIMITE_DB:
             excesos.append((ind, exceso))
+        elif en_lim:
+            bordes.append((ind, exceso))
     if faltan:
         return {"guia": "OMS 2018 (Environmental Noise Guidelines)",
                 "fuente": fuente, "fuente_desc": g["desc"],
@@ -399,16 +433,29 @@ def veredicto_oms(res):
                 "estado": "sin_datos", "detalle": det,
                 "nota": ("faltan " + ", ".join(ETIQUETAS[i] for i in faltan)
                          + " para poder contrastar.")}
-    if not excesos:
-        estado = "saludable"
-        nota = (f"por debajo de lo que la OMS recomienda para {g['desc'].lower()} "
-                f"(Lden < {g['lden']} dB, Lnight < {g['ln']} dB).")
-    else:
+    if excesos:
         estado = "no_saludable"
         nota = ("por encima de la recomendación de la OMS en "
                 + ", ".join(f"{ETIQUETAS[i]} +{e} dB" for i, e in excesos)
                 + ". Es una recomendación de salud, no un límite legal: se puede "
                   "cumplir el RD y estar bastante por encima de esto.")
+        if bordes:
+            nota += (" Además, "
+                     + ", ".join(f"{ETIQUETAS[i]} ({e:+} dB)" for i, e in bordes)
+                     + " queda en la franja de indecisión.")
+    elif bordes:
+        estado = "en_el_limite"
+        nota = (", ".join(f"{ETIQUETAS[i]} ({e:+} dB)" for i, e in bordes)
+                + f" queda a menos de {ACU_LIMITE_DB:g} dB de la recomendación: "
+                f"con un sensor de esta clase, 'saludable' y 'no_saludable' son "
+                f"igual de indefendibles a esta distancia del umbral. En el "
+                f"despliegue real un nodo cruzó el umbral con un cambio de "
+                f"1,1 dB en cuatro días.")
+    else:
+        estado = "saludable"
+        nota = (f"por debajo de lo que la OMS recomienda para {g['desc'].lower()} "
+                f"(Lden < {g['lden']} dB, Lnight < {g['ln']} dB), con más de "
+                f"{ACU_LIMITE_DB:g} dB de margen.")
     return {"guia": "OMS 2018 (Environmental Noise Guidelines)",
             "fuente": fuente, "fuente_desc": g["desc"],
             "fuerza_recomendacion": g["fuerza"],
@@ -530,6 +577,31 @@ def diagnostico(zona, por_nodo, nombres=None):
             "fondo. Hasta aclararlo no se puede separar un problema de "
             "calibracion de una diferencia real de exposicion.")
         return out
+
+    # Emergencia Lden - L90 por nodo. Un desfase de calibracion (ganancia mal
+    # ajustada) desplaza Lden y L90 por igual y se CANCELA en la resta, asi
+    # que esta es la unica magnitud comparable entre nodos sin calibrador. Lo
+    # que mide es el caracter del ruido: cuanto sobresalen los eventos sobre
+    # el fondo (una calle de pasadas sueltas tiene emergencia alta; un trafico
+    # continuo, baja). En el despliegue real los Lden abarcaban 23,3 dB entre
+    # nodos y las emergencias solo 6,6 dB: buena parte de aquel recorrido era
+    # calibracion, no calle. Va DESPUES del filtro de L90 no utilizable (un
+    # L90 de firmware haria la resta tan falsa como el) y ANTES del resto de
+    # diagnosticos, porque no depende del nodo al que le falte el L90.
+    if comunes:
+        emer = {nom(m): round(val(m, "lden") - val(m, "l90"), 1)
+                for m in comunes}
+        out["emergencia_db"] = dict(sorted(emer.items()))
+        if len(emer) > 1:
+            vs = list(emer.values())
+            out["recorrido_emergencia_db"] = round(max(vs) - min(vs), 1)
+        out["emergencia_nota"] = (
+            "Lden menos L90 por nodo. Un error de ganancia desplaza los dos "
+            "niveles por igual y se cancela en la resta: es lo unico "
+            "comparable entre nodos mientras no haya calibrador. Recorrido "
+            "grande en Lden con recorrido pequeno aqui apunta a desfase de "
+            "calibracion; recorrido grande tambien aqui, a caracter distinto "
+            "del ruido, que es diferencia real.")
 
     # el nodo que discrepa en Lden, ¿tiene L90?
     if len(conden) >= 3:
