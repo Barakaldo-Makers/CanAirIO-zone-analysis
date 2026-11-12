@@ -36,33 +36,50 @@ def check(nombre, cond, detalle=""):
 # ─────────────────────────────────────────────────────────────────────────────
 print("== A. metadatos: parseo tolerante y filtrado ==")
 CSV_META = (
-    "Countrycode\tTimezone\tNamespace\tAirQualityNetwork\tAirQualityStation\t"
-    "AirQualityStationEoICode\tSamplingPointId\tLongitude\tLatitude\t"
-    "AirPollutant\tAirQualityStationType\tAirQualityStationArea\n"
+    # cabeceras con ESPACIOS y 'Country' con NOMBRES, como el AQViewer real
+    "Country,Year,Air Quality Network,Air Quality Station EoI Code,"
+    "Sampling Point Id,Longitude,Latitude,Air Pollutant,"
+    "Air Quality Station Type,Air Quality Station Area\n"
     # dos estaciones cerca de Barakaldo (43.29, -2.99)
-    "ES\tEurope/Madrid\tES.BDCA\tRED1\tST1\tES0001A\tSP_0001_PM25\t-2.98\t43.30\tPM2.5\tbackground\turban\n"
-    "ES\tEurope/Madrid\tES.BDCA\tRED1\tST1\tES0001A\tSP_0001_PM10\t-2.98\t43.30\tPM10\tbackground\turban\n"
-    "ES\tEurope/Madrid\tES.BDCA\tRED1\tST1\tES0001A\tSP_0001_PM25_B\t-2.98\t43.30\tPM2.5\tbackground\turban\n"
-    "ES\tEurope/Madrid\tES.BDCA\tRED1\tST2\tES0002A\tSP_0002_PM25\t-3.01\t43.28\tPM2.5\ttraffic\turban\n"
+    "Spain,2026,NET-ES001,ES0001A,SPO-ES0001A-0001,-2.98,43.30,PM2.5,background,urban\n"
+    "Spain,2026,NET-ES001,ES0001A,SPO-ES0001A-0002,-2.98,43.30,PM10,background,urban\n"
+    "Spain,2026,NET-ES001,ES0001A,SPO-ES0001A-0003,-2.98,43.30,PM2.5,background,urban\n"
+    "Spain,2026,NET-ES001,ES0002A,SPO-ES0002A-0001,-3.01,43.28,PM2.5,traffic,urban\n"
     # contaminante que no es objetivo: fuera
-    "ES\tEurope/Madrid\tES.BDCA\tRED1\tST2\tES0002A\tSP_0002_BAP\t-3.01\t43.28\tBaP\ttraffic\turban\n"
-    # estación lejana (Madrid): fuera por radio
-    "ES\tEurope/Madrid\tES.BDCA\tRED2\tST3\tES0003A\tSP_0003_PM25\t-3.70\t40.42\tPM2.5\tbackground\turban\n"
+    "Spain,2026,NET-ES001,ES0002A,SPO-ES0002A-0002,-3.01,43.28,BaP,traffic,urban\n"
+    # estacion lejana (Madrid): fuera por radio
+    "Spain,2026,NET-ES002,ES0003A,SPO-ES0003A-0001,-3.70,40.42,PM2.5,background,urban\n"
     # fila rota: fuera sin reventar
-    "ES\tEurope/Madrid\tES.BDCA\tRED2\tST4\tES0004A\tSP_0004_PM25\tno_numero\t43.0\tPM2.5\t\t\n"
-    # duplicado exacto spo+metrica: fuera
-    "ES\tEurope/Madrid\tES.BDCA\tRED1\tST1\tES0001A\tSP_0001_PM25\t-2.98\t43.30\tPM2.5\tbackground\turban\n"
+    "Spain,2026,NET-ES002,ES0004A,SPO-ES0004A-0001,no_numero,43.0,PM2.5,,\n"
+    # MISMO punto en un anio viejo y con otras coordenadas: debe ganar 2026
+    "Spain,2019,NET-ES001,ES0001A,SPO-ES0001A-0001,-2.50,43.00,PM2.5,background,urban\n"
+    # punto DADO DE BAJA en 2015: fuera por anio
+    "Spain,2015,NET-ES001,ES0009A,SPO-ES0009A-0001,-2.99,43.29,PM2.5,background,urban\n"
 )
 ruta_meta = "/tmp/eea-cache-test/meta_sintetico.csv"
 os.makedirs("/tmp/eea-cache-test", exist_ok=True)
 with open(ruta_meta, "w", encoding="utf-8") as f:
     f.write(CSV_META)
 spos = eea._parsea_metadatos(ruta_meta)
-check("A1 filtra objetivo, duplicados y filas rotas", len(spos) == 5,
+# 5 = ES0001A x3 (pm25, pm10, pm25) + ES0002A pm25 + ES0003A pm25 (Madrid,
+# que se parsea bien y solo cae despues, por radio). Fuera: BaP, fila rota,
+# el duplicado de 2019 y la baja de 2015.
+check("A1 filtra objetivo, duplicados, filas rotas y bajas", len(spos) == 5,
       f"{len(spos)} spos: {[s['spo'] for s in spos]}")
+check("A1b 'Spain' NO se recorta a 'SP': el ISO sale del EoI",
+      {s["pais"] for s in spos} == {"ES"},
+      str({s["pais"] for s in spos}))
+check("A1c gana la fila del anio mas alto (coordenadas de 2026)",
+      all(abs(s["lat"] - 43.30) < 1e-9 for s in spos
+          if s["spo"] == "SPO-ES0001A-0001"),
+      str([s["lat"] for s in spos if s["spo"] == "SPO-ES0001A-0001"]))
+check("A1d el punto dado de baja en 2015 queda fuera",
+      all("ES0009A" not in s["eoi"] for s in spos),
+      str([s["eoi"] for s in spos]))
 check("A2 conserva ambos instrumentos de PM2.5 de ES0001A",
       sum(1 for s in spos if s["eoi"] == "ES0001A"
-          and s["metrica"] == "pm25") == 2)
+          and s["metrica"] == "pm25") == 2,
+      str([(s["spo"], s["metrica"]) for s in spos]))
 
 eea._meta_cache.update(t=time.time(), spos=spos)   # siembra la caché
 
@@ -75,6 +92,51 @@ check("A4 agrupa sampling points por metrica",
       and len(cerca[0]["spos"]["pm25"]) == 2, str(cerca[0]["spos"]))
 check("A5 Madrid queda fuera del radio",
       all(st["eoi"] != "ES0003A" for st in cerca))
+check("A5b spos_todos se rellena siempre",
+      sorted(cerca[0]["spos_todos"]) == ["SPO-ES0001A-0001",
+                                          "SPO-ES0001A-0002",
+                                          "SPO-ES0001A-0003"],
+      str(cerca[0].get("spos_todos")))
+check("A5c _iso_de_eoi ignora el prefijo literal SPO-",
+      eea._iso_de_eoi("", "SPO-ES0001A-0001") == "ES"
+      and eea._iso_de_eoi("AD0942A") == "AD",
+      f'{eea._iso_de_eoi("", "SPO-ES0001A-0001")} / {eea._iso_de_eoi("AD0942A")}')
+
+# A6: el metadato real llega como ZIP; se decide por los bytes
+ruta_zip = "/tmp/eea-cache-test/meta.zip"
+with zipfile.ZipFile(ruta_zip, "w") as zf:
+    zf.writestr("Airquality_Dissem.b2g.measurements.csv", CSV_META)
+with open(ruta_zip, "rb") as f:
+    check("A6 un ZIP se reconoce por su magia PK", f.read(2) == b"PK")
+
+# A7: metadato SIN columna de contaminante -> no filtra, lo dira el parquet
+sin_pol = "\n".join(
+    ",".join(c for i, c in enumerate(linea.split(",")) if i != 7)
+    for linea in CSV_META.strip().split("\n"))
+ruta_sp = "/tmp/eea-cache-test/meta_sin_pol.csv"
+with open(ruta_sp, "w", encoding="utf-8") as f:
+    f.write(sin_pol + "\n")
+spos_sp = eea._parsea_metadatos(ruta_sp)
+# 6 = los 5 de A1 mas el punto de BaP, que sin columna de contaminante ya
+# no se puede filtrar aqui: lo resolvera el parquet, que si lo dice.
+check("A7 sin columna de contaminante conserva los spos",
+      len(spos_sp) == 6 and all(s["metrica"] == "" for s in spos_sp),
+      f"{len(spos_sp)} spos, metricas={ {s['metrica'] for s in spos_sp} }")
+check("A8 y el pais sigue siendo ES sin columna de contaminante",
+      all(s["pais"] == "ES" for s in spos_sp), str(spos_sp[0]))
+
+# A9: respuesta HTML (lo que devuelve el servicio sin User-Agent: 200, no 403)
+ruta_html = "/tmp/eea-cache-test/respuesta.html"
+with open(ruta_html, "wb") as f:
+    f.write(b"<!DOCTYPE html>\n<html><head><title>AQViewer</title></head>")
+import zipfile as _zf
+try:
+    with open(ruta_html, "rb") as f:
+        cabeza = f.read(512)
+    es_html = cabeza[:2] != b"PK" and b"<html" in cabeza[:200].lower()
+except Exception:
+    es_html = False
+check("A9 una respuesta HTML se reconoce (200 + text/html sin UA)", es_html)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print("== B. parquet: vocabulario, unidades, validez, horas ==")
@@ -103,22 +165,22 @@ def zip_parquet():
 
     for i in range(1, 25):
         # ES0001A publica PM2.5 por su primer instrumento; notacion directa
-        fila("ES/SP_0001_PM25", "PM2.5", i, 10.0)
+        fila("ES/SPO-ES0001A-0001", "PM2.5", i, 10.0)
         # ES0002A llega como CODIGO y en URI alternando: ambas deben valer
-        fila("ES/SP_0002_PM25",
+        fila("ES/SPO-ES0002A-0001",
              "6001" if i % 2 else
              "http://dd.eionet.europa.eu/vocabulary/aq/pollutant/6001",
              i, 20.0)
     # PM10 del segundo instrumento con codigo '5'
-    fila("ES/SP_0001_PM10", "5", 1, 30.0)
+    fila("ES/SPO-ES0001A-0002", "5", 1, 30.0)
     # CO en mg/m3: x1000 (no es objetivo del test de media porque nadie mas lo da)
-    fila("ES/SP_0001_PM10", "10", 2, 0.4, unit="mg/m3")
+    fila("ES/SPO-ES0001A-0002", "10", 2, 0.4, unit="mg/m3")
     # invalida: fuera
-    fila("ES/SP_0001_PM25", "PM2.5", 30, 99.0, validez=-1)
+    fila("ES/SPO-ES0001A-0001", "PM2.5", 30, 99.0, validez=-1)
     # unidad desconocida: fuera
-    fila("ES/SP_0001_PM25", "PM2.5", 31, 88.0, unit="ppb")
+    fila("ES/SPO-ES0001A-0001", "PM2.5", 31, 88.0, unit="ppb")
     # contaminante no objetivo: fuera
-    fila("ES/SP_0001_PM25", "BaP", 1, 7.7)
+    fila("ES/SPO-ES0001A-0001", "BaP", 1, 7.7)
 
     tabla = pa.table(filas)
     buf = io.BytesIO()
@@ -150,17 +212,17 @@ eea._data_cache.clear()
 
 datos = eea._descarga_parquet(["ES"], 48)
 check("B1 indexa por spo sin prefijo de pais",
-      "SP_0001_PM25" in datos and "SP_0002_PM25" in datos,
+      "SPO-ES0001A-0001" in datos and "SPO-ES0002A-0001" in datos,
       str(list(datos))[:90])
 check("B2 acepta notacion, codigo y URI del contaminante",
-      len(datos["SP_0002_PM25"]["pm25"]) == 24,
-      str(len(datos.get("SP_0002_PM25", {}).get("pm25", {}))))
+      len(datos["SPO-ES0002A-0001"]["pm25"]) == 24,
+      str(len(datos.get("SPO-ES0002A-0001", {}).get("pm25", {}))))
 check("B3 mg/m3 se convierte x1000",
-      abs(list(datos["SP_0001_PM10"]["co"].values())[0] - 400.0) < 1e-6,
-      str(datos["SP_0001_PM10"].get("co")))
+      abs(list(datos["SPO-ES0001A-0002"]["co"].values())[0] - 400.0) < 1e-6,
+      str(datos["SPO-ES0001A-0002"].get("co")))
 check("B4 validez<1 y unidad desconocida quedan fuera",
       all(abs(v - 10.0) < 1e-6
-          for v in datos["SP_0001_PM25"]["pm25"].values()))
+          for v in datos["SPO-ES0001A-0001"]["pm25"].values()))
 check("B5 el cuerpo pide dataset UTD y aggregationType string",
       llamadas[0][1]["dataset"] == 1
       and llamadas[0][1]["aggregationType"] == "hour", str(llamadas[0][1]))
@@ -179,6 +241,31 @@ check("C3 fuente por metrica con codigos EoI",
       sorted(fuente.get("pm25", [])) == ["ES0001A", "ES0002A"], str(fuente))
 check("C4 un solo sampling point por estacion y metrica (no duplica ST1)",
       fuente.get("pm25", []).count("ES0001A") == 1, str(fuente))
+
+# C6: con metadato CIEGO (sin contaminante) las series salen igual, porque
+# el contaminante lo pone el parquet. Es el caso que protege de un cambio de
+# nombre en la columna del metadato.
+eea._meta_cache.update(t=time.time(), spos=spos_sp)
+eea._data_cache.clear()
+s6, f6 = eea.fetch_official_series(48, lat=43.29, lon=-2.99)
+check("C6 metadato sin contaminante: el parquet lo resuelve",
+      [abs(v - 15.0) < 1e-6 for v in s6.get("pm25", {}).values()].count(True) == 24
+      and sorted(f6.get("pm25", [])) == ["ES0001A", "ES0002A"],
+      f"pm25={len(s6.get('pm25', {}))}h fuente={f6.get('pm25')}")
+check("C6b y tambien recupera el co en mg/m3 de ES0001A",
+      abs(list(s6.get("co", {}).values())[0] - 400.0) < 1e-6,
+      str(s6.get("co")))
+
+# C7: escotilla manual, sin metadato ni coordenadas
+eea._meta_cache.update(t=0.0, spos=None)
+eea._data_cache.clear()
+eea.EEA_FORCE_SPOS = ["ES:SPO-ES0001A-0001"]
+s7, f7 = eea.fetch_official_series(48)
+check("C7 EEA_FORCE_SPOS funciona sin metadato",
+      len(s7.get("pm25", {})) == 24 and f7.get("pm25") == ["SPO-ES0001A-0001"],
+      str(f7))
+eea.EEA_FORCE_SPOS = []
+eea._meta_cache.update(t=time.time(), spos=spos)
 
 eea._data_cache.clear()
 llamadas.clear()

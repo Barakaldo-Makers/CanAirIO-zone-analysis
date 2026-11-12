@@ -47,6 +47,7 @@ import io
 import logging
 import math
 import os
+import re
 import time
 import zipfile
 
@@ -57,9 +58,17 @@ log = logging.getLogger("eea")
 EEA_ENABLED = os.getenv("EEA_ENABLED", "1") == "1"
 EEA_API = os.getenv(
     "EEA_API", "https://eeadmz1-downloads-api-appservice.azurewebsites.net")
+# Metadato de sampling points. Es un ZIP con un CSV dentro, servido por el
+# AQViewer de la EEA. La URL está verificada contra la implementación del
+# paquete R 'EEAaq' (CRAN), que es la que usa la comunidad científica; el
+# servicio devuelve 403 a peticiones sin User-Agent, así que se manda uno.
 EEA_METADATA_URL = os.getenv(
     "EEA_METADATA_URL",
-    "https://discomap.eea.europa.eu/map/fme/metadata/PanEuropean_metadata.csv")
+    "https://discomap.eea.europa.eu/App/AQViewer/download"
+    "?fqn=Airquality_Dissem.b2g.measurements&f=csv")
+EEA_USER_AGENT = os.getenv(
+    "EEA_USER_AGENT",
+    "CanAirIO-zone-analysis/1.5 (+https://github.com/Barakaldo-Makers)")
 EEA_CACHE_DIR = os.getenv("EEA_CACHE_DIR", "/tmp/eea-cache")
 EEA_METADATA_TTL = int(os.getenv("EEA_METADATA_TTL", str(7 * 86400)))
 EEA_DATA_TTL = int(os.getenv("EEA_DATA_TTL", "1500"))
@@ -72,6 +81,12 @@ EEA_DATASET = int(os.getenv("EEA_DATASET", "1"))
 EEA_TARGET_METRICS = [m.strip() for m in os.getenv(
     "EEA_TARGET_METRICS", "pm25,pm10,no2,o3,so2,co,nh3").split(",")
     if m.strip()]
+# Escotilla de emergencia, al estilo de EUSKADI_STATIONS: sampling points
+# fijados a mano, con su país. Formato: "ES:SP_1234,ES:SP_5678". Sirve si el
+# metadato del AQViewer cambia de sitio otra vez; las coordenadas dejan de
+# hacer falta porque la selección ya está hecha.
+EEA_FORCE_SPOS = [p.strip() for p in os.getenv("EEA_FORCE_SPOS", "").split(",")
+                  if p.strip()]
 
 # métrica del proyecto <-> vocabulario Eionet (notación, código).
 # Códigos del vocabulario http://dd.eionet.europa.eu/vocabulary/aq/pollutant,
@@ -135,6 +150,28 @@ def _met_de_eea(valor):
     return EEA_A_MET.get(s)
 
 
+def _iso_de_eoi(eoi, spo=""):
+    """
+    Codigo ISO del pais a partir del codigo EoI de la estacion.
+
+    El metadato del AQViewer trae una columna 'Country' con el NOMBRE del
+    pais ('Andorra', 'Spain'), no su codigo, y la API de descargas exige
+    codigos. Recortar el nombre a dos letras da 'SP' para Spain y 'AN' para
+    Andorra: ambos invalidos, y el fallo seria SILENCIOSO (descarga vacia y
+    caida a CAMS sin un solo error). El codigo EoI si lleva el ISO delante
+    por convenio: 'AD0942A' -> AD, 'ES1438A' -> ES. El Sampling Point Id
+    tambien suele llevarlo ('SPO-AD0942A-0001'), y sirve de respaldo.
+    """
+    for cand in (eoi or "", spo or ""):
+        # dos letras seguidas de un digito: 'ES0001A' -> ES, 'SPO-AD0942A'
+        # -> AD. Exigir el digito es lo que descarta el prefijo literal
+        # 'SPO-' (un barrido letra a letra devolvia 'PO', lo cazo su test).
+        m = re.search(r"([A-Z]{2})\d", (cand or "").upper())
+        if m:
+            return m.group(1)
+    return ""
+
+
 def _spo_norm(spo):
     """El Samplingpoint del parquet lleva prefijo de país ('ES/SP_...'); el
     metadato puede traerlo sin él. Se compara siempre SIN prefijo."""
@@ -174,16 +211,47 @@ def fetch_station_index(force=False):
             _meta_cache.update(t=now, spos=spos)
             return spos
 
-    bruto = _cache_file("PanEuropean_metadata.csv")
+    bruto = _cache_file("metadata_bruto.bin")
     log.info("EEA: descargando metadatos de estaciones (%s)", EEA_METADATA_URL)
     with requests.get(EEA_METADATA_URL, stream=True,
+                      headers={"User-Agent": EEA_USER_AGENT,
+                               "Accept": "*/*"},
                       timeout=EEA_META_TIMEOUT) as r:
         r.raise_for_status()
         with open(bruto, "wb") as f:
             for trozo in r.iter_content(chunk_size=1 << 20):
                 f.write(trozo)
 
-    spos = _parsea_metadatos(bruto)
+    # El AQViewer sirve un ZIP con el CSV dentro, pero una URL alternativa
+    # podria servir el CSV pelado: se decide por los bytes, no por la
+    # extension ni por la fe.
+    csv_path = bruto
+    with open(bruto, "rb") as f:
+        cabeza = f.read(512)
+    magia = cabeza[:4]
+    if magia[:2] != b"PK" and b"<html" in cabeza[:200].lower():
+        # sin User-Agent este servicio devuelve 200 con una pagina HTML, no
+        # un 403: hay que detectarlo o se intentaria parsear HTML como CSV
+        raise RuntimeError(
+            "metadatos EEA: la respuesta es HTML, no datos. Suele ser el "
+            "filtro de User-Agent del AQViewer; revisa EEA_USER_AGENT o "
+            "ejecuta scripts/sonda-eea.sh para ver que devuelve la URL.")
+    if magia[:2] == b"PK":
+        with zipfile.ZipFile(bruto) as z:
+            dentro = [n for n in z.namelist() if n.lower().endswith(".csv")]
+            if not dentro:
+                raise RuntimeError(
+                    "metadatos EEA: el ZIP no trae ningun .csv (%s)"
+                    % z.namelist()[:5])
+            csv_path = _cache_file("metadata_bruto.csv")
+            with z.open(dentro[0]) as src, open(csv_path, "wb") as dst:
+                while True:
+                    trozo = src.read(1 << 20)
+                    if not trozo:
+                        break
+                    dst.write(trozo)
+
+    spos = _parsea_metadatos(csv_path)
     if not spos:
         raise RuntimeError("metadatos EEA: 0 sampling points tras filtrar; "
                            "¿ha cambiado el formato del CSV?")
@@ -194,10 +262,11 @@ def fetch_station_index(force=False):
         for s in spos:
             w.writerow([s["spo"], s["pais"], s["eoi"], s["lat"], s["lon"],
                         s["metrica"], s["tipo"], s["area"]])
-    try:
-        os.remove(bruto)              # el crudo ya no hace falta
-    except OSError:
-        pass
+    for tmp in {bruto, csv_path}:     # el crudo ya no hace falta
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
     _meta_cache.update(t=now, spos=spos)
     log.info("EEA: índice con %d sampling points de %d métricas",
              len(spos), len({s['metrica'] for s in spos}))
@@ -242,7 +311,8 @@ def _parsea_metadatos(ruta):
             return None
 
         i_spo = col("SamplingPointId", "Sampling Point Id", "SamplingPoint")
-        i_pais = col("Countrycode", "Country Code", "Country")
+        # el AQViewer llama al pais 'ISO'; otras versiones 'Countrycode'
+        i_pais = col("ISO", "Countrycode", "Country Code", "Country")
         i_eoi = col("AirQualityStationEoICode", "EoICode",
                     "Air Quality Station EoI Code")
         i_lat = col("Latitude")
@@ -250,40 +320,76 @@ def _parsea_metadatos(ruta):
         i_pol = col("AirPollutant", "Air Pollutant", "AirPollutantCode")
         i_tipo = col("AirQualityStationType", "StationType")
         i_area = col("AirQualityStationArea", "StationArea")
-        if None in (i_spo, i_lat, i_lon, i_pol):
+        # La tabla trae una fila por punto Y AÑO. Sin filtrar, el índice
+        # incluye puntos dados de baja hace años, que pueden desplazar a
+        # estaciones vivas al recortar a EEA_MAX_STATIONS. Se conserva la
+        # fila del año más alto de cada (punto, métrica).
+        i_anio = col("Year", "Reporting Year")
+        # El contaminante es OPCIONAL a proposito: el parquet de datos trae
+        # su propia columna Pollutant y esa es la autoritativa. Al metadato
+        # solo se le pide responder "que sampling points hay cerca y de que
+        # pais", que es lo unico que no esta en el parquet. Asi un cambio de
+        # nombre en la columna de contaminante no tumba el modulo.
+        if None in (i_spo, i_lat, i_lon):
             raise RuntimeError(
-                "metadatos EEA: faltan columnas imprescindibles; cabecera = %s"
+                "metadatos EEA: faltan columnas imprescindibles "
+                "(SamplingPointId/Latitude/Longitude); cabecera = %s"
                 % cab[:12])
+        if i_pol is None:
+            log.info("EEA: el metadato no trae columna de contaminante; "
+                     "se tomara del parquet de datos")
 
-        vistos = set()
-        out = []
+        mejor = {}            # (spo, met) -> (anio, dict)
         for fila in rd:
             try:
-                met = _met_de_eea(fila[i_pol])
-                if met is None or met not in EEA_TARGET_METRICS:
-                    continue
+                if i_pol is not None:
+                    met = _met_de_eea(fila[i_pol])
+                    # con columna de contaminante se filtra ya aqui, que
+                    # recorta el indice de ~150k filas a las utiles
+                    if met is None or met not in EEA_TARGET_METRICS:
+                        continue
+                else:
+                    met = ""          # lo dira el parquet
                 spo = _spo_norm(fila[i_spo])
-                if not spo or (spo, met) in vistos:
+                if not spo:
                     continue
                 lat = float(fila[i_lat])
                 lon = float(fila[i_lon])
             except (IndexError, TypeError, ValueError):
                 continue
-            vistos.add((spo, met))
-            pais = (fila[i_pais].strip().upper()[:2]
-                    if i_pais is not None and i_pais < len(fila) else "")
-            out.append({
-                "spo": spo,
-                "pais": pais,
-                "eoi": (fila[i_eoi].strip()
-                        if i_eoi is not None and i_eoi < len(fila) else spo),
+
+            def celda(i):
+                return (fila[i].strip()
+                        if i is not None and i < len(fila) else "")
+
+            eoi = celda(i_eoi) or spo
+            # el nombre de pais solo vale si YA es un codigo de dos letras;
+            # si no, se saca del EoI (ver _iso_de_eoi)
+            crudo = celda(i_pais)
+            pais = (crudo.upper() if len(crudo) == 2 and crudo.isalpha()
+                    else _iso_de_eoi(eoi, spo))
+            try:
+                anio = int(celda(i_anio) or 0)
+            except ValueError:
+                anio = 0
+            clave = (spo, met)
+            previo = mejor.get(clave)
+            if previo is not None and previo[0] >= anio:
+                continue
+            mejor[clave] = (anio, {
+                "spo": spo, "pais": pais, "eoi": eoi,
                 "lat": lat, "lon": lon, "metrica": met,
-                "tipo": (fila[i_tipo].strip()
-                         if i_tipo is not None and i_tipo < len(fila) else ""),
-                "area": (fila[i_area].strip()
-                         if i_area is not None and i_area < len(fila) else ""),
+                "tipo": celda(i_tipo), "area": celda(i_area),
             })
-        return out
+
+        if i_anio is not None and mejor:
+            # solo el ultimo anio y el anterior: lo demas esta de baja
+            tope = max(a for a, _ in mejor.values())
+            vivos = [d for a, d in mejor.values() if a >= tope - 1]
+            log.info("EEA: metadato con anios hasta %d; %d de %d puntos vivos",
+                     tope, len(vivos), len(mejor))
+            return vivos
+        return [d for _a, d in mejor.values()]
 
 
 def nearest_stations(lat, lon, radius_km=None, max_n=None):
@@ -304,11 +410,33 @@ def nearest_stations(lat, lon, radius_km=None, max_n=None):
         st = por_eoi.setdefault(s["eoi"], {
             "eoi": s["eoi"], "name": s["eoi"], "pais": s["pais"],
             "dist_km": round(d, 2), "tipo": s["tipo"], "area": s["area"],
-            "spos": {}})
+            "spos": {}, "spos_todos": []})
         st["dist_km"] = min(st["dist_km"], round(d, 2))
-        st["spos"].setdefault(s["metrica"], []).append(s["spo"])
+        if s["spo"] not in st["spos_todos"]:
+            st["spos_todos"].append(s["spo"])
+        # 'spos' solo se rellena si el metadato traia contaminante; es
+        # informativo (lo enseña /eea-debug). La extraccion de series va
+        # siempre por 'spos_todos' + la columna Pollutant del parquet.
+        if s["metrica"]:
+            st["spos"].setdefault(s["metrica"], []).append(s["spo"])
     cerca = sorted(por_eoi.values(), key=lambda x: x["dist_km"])
     return cerca[:max_n]
+
+
+def _estaciones_forzadas():
+    """EEA_FORCE_SPOS ('ES:SP_1234,...') -> una pseudo-estación por punto.
+    Sin coordenadas y sin metadato: la selección ya la hizo el humano."""
+    out = []
+    for item in EEA_FORCE_SPOS:
+        pais, _, spo = item.partition(":")
+        pais, spo = pais.strip().upper(), _spo_norm(spo or pais)
+        if not spo:
+            continue
+        out.append({"eoi": spo, "name": spo,
+                    "pais": pais if len(pais) == 2 else "",
+                    "dist_km": None, "tipo": "", "area": "",
+                    "spos": {}, "spos_todos": [spo]})
+    return out
 
 
 def _descarga_parquet(paises, horas):
@@ -428,9 +556,12 @@ def fetch_official_series(hours=48, lat=None, lon=None, stations=None):
     if not EEA_ENABLED:
         return {}, {}
     if stations is None:
-        if not _dentro_de_europa(lat, lon):
-            return {}, {}
-        stations = nearest_stations(lat, lon)
+        if EEA_FORCE_SPOS:
+            stations = _estaciones_forzadas()
+        else:
+            if not _dentro_de_europa(lat, lon):
+                return {}, {}
+            stations = nearest_stations(lat, lon)
     if not stations:
         return {}, {}
 
@@ -444,9 +575,16 @@ def fetch_official_series(hours=48, lat=None, lon=None, stations=None):
     cutoff = time.time() - hours * 3600
     acc, fuente = {}, {}
     for st in stations:
-        for met, spos in sorted((st.get("spos") or {}).items()):
-            for spo in spos:
-                serie = (datos.get(spo) or {}).get(met) or {}
+        # QUÉ mide cada sampling point lo dice el parquet, no el metadato:
+        # el parquet trae su propia columna Pollutant y es la autoritativa.
+        # El metadato solo ha servido para decir qué puntos hay cerca.
+        spos = st.get("spos_todos") or sorted(
+            {s for lst in (st.get("spos") or {}).values() for s in lst})
+        ya_puestas = set()             # métricas que esta estación ya aportó
+        for spo in spos:
+            for met, serie in sorted((datos.get(spo) or {}).items()):
+                if met in ya_puestas:
+                    continue           # un sampling point por estación y métrica
                 aporto = False
                 for t, v in serie.items():
                     if t < cutoff:
@@ -454,8 +592,8 @@ def fetch_official_series(hours=48, lat=None, lon=None, stations=None):
                     acc.setdefault(met, {}).setdefault(t, []).append(v)
                     aporto = True
                 if aporto:
+                    ya_puestas.add(met)
                     fuente.setdefault(met, []).append(st["name"])
-                    break              # un sampling point por estación y métrica
 
     combined = {met: {t: round(sum(vs) / len(vs), 2)
                       for t, vs in por_h.items()}
@@ -467,7 +605,17 @@ def diagnose(lat, lon, hours=48):
     """Diagnóstico para /eea-debug: qué hay en el radio y qué se obtiene."""
     out = {"enabled": EEA_ENABLED, "radius_km": EEA_RADIUS_KM,
            "hour_offset": EEA_HOUR_OFFSET, "dataset": EEA_DATASET,
+           "metadata_url": EEA_METADATA_URL,
+           "spos_forzados": EEA_FORCE_SPOS or None,
            "dentro_de_cobertura": _dentro_de_europa(lat, lon)}
+    if EEA_FORCE_SPOS:
+        series, fuente = fetch_official_series(hours)
+        out["stations"] = [{"eoi": st["eoi"], "pais": st["pais"]}
+                           for st in _estaciones_forzadas()]
+        out["series_horas"] = {m: len(p) for m, p in sorted(series.items())}
+        out["fuente_por_metrica"] = fuente
+        out["nota"] = "seleccion manual por EEA_FORCE_SPOS (sin metadato)"
+        return out
     if not out["dentro_de_cobertura"]:
         out["nota"] = ("fuera de la caja de cobertura EEA: este punto no es "
                        "cosa de este módulo (lo cubre OpenAQ o CAMS)")
@@ -475,7 +623,8 @@ def diagnose(lat, lon, hours=48):
     cerca = nearest_stations(lat, lon)
     out["stations"] = [{k: st[k] for k in
                         ("eoi", "pais", "dist_km", "tipo", "area")}
-                       | {"metricas": sorted(st["spos"])}
+                       | {"metricas": sorted(st["spos"]) or "(las dira el parquet)",
+                          "n_spos": len(st.get("spos_todos") or [])}
                        for st in cerca]
     if not cerca:
         out["nota"] = "sin sampling points EEA en el radio"

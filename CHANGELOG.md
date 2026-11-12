@@ -12,8 +12,15 @@ Versionado semántico.
   red vasca reporta a la EEA, así que es el respaldo automático de
   `euskadi.py` si Open Data Euskadi se cae, y cubre cualquier zona europea
   futura sin escribir un módulo por país. Las coordenadas de estación salen
-  del metadato paneuropeo (la API de descargas no las da); se cachean en disco
-  compactadas. Unidades: µg/m³ pasa, mg/m³ se convierte (CO), cualquier otra
+  del metadato del AQViewer (la API de descargas no las da): es un **ZIP con
+  un CSV dentro** y **rechaza con 403 las peticiones sin User-Agent**; la URL
+  está verificada contra la implementación del paquete R `EEAaq` (CRAN). Se
+  cachea en disco compactado. El **contaminante de cada punto lo pone el
+  parquet de datos, no el metadato**: el parquet trae su propia columna
+  `Pollutant` y es la autoritativa, así que un cambio de nombre en esa columna
+  del metadato ya no puede tumbar el módulo. Y queda `EEA_FORCE_SPOS` para
+  fijar sampling points a mano si el metadato se mueve de sitio: con eso el
+  módulo funciona sin metadato y sin coordenadas. Unidades: µg/m³ pasa, mg/m³ se convierte (CO), cualquier otra
   descarta la fila y se cuenta. `Validity < 1` se descarta. Nueva dependencia
   **pyarrow**, solo para este módulo: si falta, `eea.py` se desactiva con un
   error claro y el ciclo sigue.
@@ -22,6 +29,26 @@ Versionado semántico.
   etiquetara la hora con otro criterio saldría aquí como `lag_h != 0`, y se
   corrige con `EEA_HOUR_OFFSET` sin tocar código. `/official-sources` enseña
   `eea` como proveedor cuando es quien cubriría la zona.
+- **El código de país se saca del código EoI, no del nombre.** El metadato
+  trae una columna `Country` con el NOMBRE (`Spain`, `Andorra`), no el ISO, y
+  la API de descargas exige códigos: recortar el nombre a dos letras daba
+  `SP` y `AN`, ambos inválidos, y el fallo habría sido **silencioso** —
+  descarga vacía y caída a CAMS sin un solo error en el log. El código EoI
+  lleva el ISO delante por convenio (`ES0001A`, `AD0942A`), y el Sampling
+  Point Id también (`SPO-ES0001A-0001`). Lo encontró `sonda-eea.sh` al
+  mirar la primera fila real del fichero.
+- **Se descartan los puntos dados de baja.** La tabla tiene una fila por punto
+  **y año**; sin filtrar, el índice incluía sampling points retirados hace
+  años, que podían desplazar a estaciones vivas al recortar a
+  `EEA_MAX_STATIONS`. Ahora gana la fila del año más alto de cada punto y se
+  conservan solo los dos últimos años.
+- **Una respuesta HTML se detecta y se dice.** Sin User-Agent el AQViewer no
+  responde 403: responde **200 con una página HTML**, que es peor, porque se
+  intentaría parsear como CSV. Ahora se reconoce y el error lo explica.
+- `sonda-eea.sh`: comprueba de solo lectura si el metadato de la EEA se puede
+  descargar y si trae las columnas que el módulo necesita, con y sin
+  User-Agent. Sirve para resolver en dos minutos un cambio de URL sin tocar
+  código.
 
 ## [1.4.0] — 2026-11-11
 
