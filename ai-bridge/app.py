@@ -52,6 +52,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import publisher
 import euskadi
 import openaq
+import eea
 import acustica
 import narrador
 
@@ -1520,6 +1521,25 @@ def fetch_official_any(geo3, hours, t_c=None, p_hpa=None, mac=None):
                 return off, src, meta
         except Exception as e:
             log.warning("referencia OpenAQ fallo en %s: %s", geo3, e)
+
+    # 3) EEA: descarga directa de la red oficial europea. Va DETRÁS de OpenAQ
+    #    a propósito: para Europa sirven las mismas estaciones y la vía OpenAQ
+    #    ya está probada en produccion, así que esta es la redundancia (y el
+    #    respaldo automático de euskadi.py si Open Data Euskadi se cae).
+    if eea.EEA_ENABLED:
+        try:
+            cerca = eea.nearest_stations(lat, lon)
+            if cerca:
+                off, src = eea.fetch_official_series(
+                    hours, lat=lat, lon=lon, stations=cerca)
+                if off:
+                    meta["provider"] = "eea"
+                    meta["stations"] = [
+                        {"name": s["eoi"], "dist_km": s["dist_km"],
+                         "country": s["pais"]} for s in cerca]
+                    return off, src, meta
+        except Exception as e:
+            log.warning("referencia EEA fallo en %s: %s", geo3, e)
 
     return {}, {}, meta
 
@@ -3972,6 +3992,62 @@ def openaq_debug(geo3=None):
                      "sensors_located": nsens}
     return jsonify(out)
 
+@app.route("/eea-debug")
+@app.route("/eea-debug/<geo3>")
+def eea_debug(geo3=None):
+    """
+    Diagnóstico de la referencia europea EEA para una zona, con un cotejo de
+    ALINEACIÓN HORARIA contra Euskadi cuando las dos fuentes cubren el punto:
+    sirven las mismas cabinas, así que si el parquet de la EEA etiquetara la
+    hora con otro criterio, el desfase sale aquí como un lag != 0 y se corrige
+    con EEA_HOUR_OFFSET sin tocar código.
+    """
+    geo3 = geo3 or _primera_zona_activa()
+    hours = int(request.args.get("hours", 48))
+    lat, lon, nsens = zone_sensor_center(geo3)
+    if lat is None:
+        return jsonify({"error": f"sin posicion para la zona {geo3}"}), 404
+    try:
+        out = eea.diagnose(lat, lon, hours=hours)
+    except Exception as e:
+        return jsonify({"zone": geo3, "error": str(e)}), 502
+    out["zone"] = geo3
+    out["center"] = {"lat": round(lat, 4), "lon": round(lon, 4),
+                     "sensors_located": nsens}
+
+    # cotejo de alineación horaria contra la red local, si cubre este punto
+    try:
+        if euskadi.EUSKADI_ENABLED and out.get("series_horas"):
+            s_eea, _ = eea.fetch_official_series(hours, lat=lat, lon=lon)
+            s_eus, _ = euskadi.fetch_official_series(hours, lat=lat, lon=lon)
+            cotejo = {}
+            for m in sorted(set(s_eea) & set(s_eus)):
+                a, b = s_eea[m], s_eus[m]
+                mejor = None
+                for lag in (-2, -1, 0, 1, 2):
+                    difs = [abs(a[t + lag * 3600] - b[t]) for t in b
+                            if (t + lag * 3600) in a]
+                    if len(difs) >= 6:
+                        med = sorted(difs)[len(difs) // 2]
+                        if mejor is None or med < mejor[1]:
+                            mejor = (lag, med, len(difs))
+                if mejor:
+                    cotejo[m] = {"lag_h": mejor[0],
+                                 "mediana_dif": round(mejor[1], 2),
+                                 "horas_comunes": mejor[2]}
+            if cotejo:
+                out["cotejo_euskadi"] = cotejo
+                lags = {c["lag_h"] for c in cotejo.values()}
+                out["cotejo_nota"] = (
+                    "lag_h=0 en todas las métricas: las horas están alineadas."
+                    if lags == {0} else
+                    "ATENCIÓN: lag_h != 0 — ajusta EEA_HOUR_OFFSET a ese valor "
+                    "y reinicia; las dos fuentes sirven las mismas cabinas, "
+                    "así que el desfase es de etiquetado, no de aire.")
+    except Exception as e:
+        out["cotejo_error"] = str(e)
+    return jsonify(out)
+
 @app.route("/official-sources")
 def official_sources_endpoint():
     """
@@ -4011,6 +4087,15 @@ def official_sources_endpoint():
                 if locs:
                     row["provider"] = "openaq"
                     row["stations"] = [l["name"] for l in locs]
+            if row["provider"] is None and eea.EEA_ENABLED:
+                try:
+                    cerca = eea.nearest_stations(lat, lon)
+                except Exception as e:
+                    row["error"] = str(e)
+                    cerca = []
+                if cerca:
+                    row["provider"] = "eea"
+                    row["stations"] = [s["eoi"] for s in cerca]
         row["provider"] = row["provider"] or "cams"
         out["zones"].append(row)
     out["count"] = len(out["zones"])

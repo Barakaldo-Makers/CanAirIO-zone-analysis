@@ -3,6 +3,26 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es/1.1.0/).
 Versionado semántico.
 
+## [1.5.0] — 2026-11-12
+
+### Añadido
+- **`eea.py`: referencia oficial europea** vía el Download Service de la
+  Agencia Europea de Medio Ambiente (datos UTD/E2a horarios, parquet, sin
+  clave). Tercer eslabón de la cadena: euskadi → OpenAQ → **EEA** → CAMS. La
+  red vasca reporta a la EEA, así que es el respaldo automático de
+  `euskadi.py` si Open Data Euskadi se cae, y cubre cualquier zona europea
+  futura sin escribir un módulo por país. Las coordenadas de estación salen
+  del metadato paneuropeo (la API de descargas no las da); se cachean en disco
+  compactadas. Unidades: µg/m³ pasa, mg/m³ se convierte (CO), cualquier otra
+  descarta la fila y se cuenta. `Validity < 1` se descarta. Nueva dependencia
+  **pyarrow**, solo para este módulo: si falta, `eea.py` se desactiva con un
+  error claro y el ciclo sigue.
+- Endpoint `/eea-debug[/<geo3>]` con **cotejo de alineación horaria contra
+  Euskadi**: las dos fuentes sirven las mismas cabinas, así que si el parquet
+  etiquetara la hora con otro criterio saldría aquí como `lag_h != 0`, y se
+  corrige con `EEA_HOUR_OFFSET` sin tocar código. `/official-sources` enseña
+  `eea` como proveedor cuando es quien cubriría la zona.
+
 ## [1.4.0] — 2026-11-11
 
 ### Corregido
