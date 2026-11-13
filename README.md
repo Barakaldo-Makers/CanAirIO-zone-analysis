@@ -52,8 +52,10 @@ same kind.
   `0` across the whole window are excluded: they do not have that sensor.
 - **Official reference chain.** For each zone (or each individual sensor), find
   its real position, then look for a reference-grade station within 25 km:
-  first a local network, then [OpenAQ](https://openaq.org) worldwide, and
-  CAMS/Copernicus only as a last resort.
+  first a local network, then [OpenAQ](https://openaq.org) worldwide, then
+  the [European Environment Agency](https://www.eea.europa.eu/) anywhere in
+  Europe (which also backs up the local network, and is checked against it
+  value by value), and CAMS/Copernicus only as a last resort.
 - **Confidence labels per metric,** from Spearman correlation and relative bias
   against that reference — taking the *better verdict*, not merely the better
   correlation.
@@ -144,6 +146,10 @@ For real stations outside a supported local network, get a free
 | `GET /compare/<geo3>` · `/compare-official/<geo3>` | vs CAMS · vs official stations |
 | `GET /official-sources` | which reference each active zone is using |
 | `GET /openaq-debug[/<geo3>]` · `/euskadi-debug[/<geo3>]` | reference diagnostics |
+| `GET /eea-debug[/<geo3>]` | EEA reference: stations, download trace, station-by-station check against the local network |
+| `GET /lag-scan[/<geo3>]` | which reference has the right hour: sensors vs each source shifted −3..+3 h, with day-block bootstrap |
+| `GET /acustica[/<geo3>]` | long-term noise indicators vs RD 1367/2007 and WHO 2018 |
+| `GET /narrativa/<geo3>` | plain-language summary through a remote API (off by default) |
 | `GET /esod-debug/<geo3>` | outlier filtering before/after, history state |
 | `GET /drift[/<geo3>]` · `/ref-history[/<geo3>]` | factor drift · reference history |
 | `GET /run-cycle` · `/publish` | force a cycle · force publication |

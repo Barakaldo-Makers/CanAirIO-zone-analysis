@@ -88,7 +88,8 @@ services:
       - TIER3_NO_WEATHER=1
 
       # ── Alertas: persistencia e histéresis ────────────────────────
-      - ALERT_PERSIST_H=1
+      - ALERT_PERSIST_H=2
+      - EEA_HOUR_OFFSET=-1
       - ALERT_HYSTERESIS=0.10
 
       # ── Detección de congelados (db, tmp, hum) ────────────────────

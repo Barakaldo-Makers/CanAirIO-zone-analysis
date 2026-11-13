@@ -4015,37 +4015,249 @@ def eea_debug(geo3=None):
     out["center"] = {"lat": round(lat, 4), "lon": round(lon, 4),
                      "sensors_located": nsens}
 
-    # cotejo de alineación horaria contra la red local, si cubre este punto
+    # Cotejo contra la red local: la MISMA cabina por los dos caminos, no
+    # los promedios de cada fuente. La version anterior comparaba promedios
+    # de conjuntos distintos de cabinas y salian desfases de -2 a +2 h segun
+    # la metrica; su nota recomendaba tocar EEA_HOUR_OFFSET, que habria sido
+    # un error. El veredicto lo da eea.cotejo_con, que solo dictamina un
+    # desfase si todas las parejas que coinciden al dato estan de acuerdo.
     try:
         if euskadi.EUSKADI_ENABLED and out.get("series_horas"):
-            s_eea, _ = eea.fetch_official_series(hours, lat=lat, lon=lon)
-            s_eus, _ = euskadi.fetch_official_series(hours, lat=lat, lon=lon)
-            cotejo = {}
-            for m in sorted(set(s_eea) & set(s_eus)):
-                a, b = s_eea[m], s_eus[m]
-                mejor = None
-                for lag in (-2, -1, 0, 1, 2):
-                    difs = [abs(a[t + lag * 3600] - b[t]) for t in b
-                            if (t + lag * 3600) in a]
-                    if len(difs) >= 6:
-                        med = sorted(difs)[len(difs) // 2]
-                        if mejor is None or med < mejor[1]:
-                            mejor = (lag, med, len(difs))
-                if mejor:
-                    cotejo[m] = {"lag_h": mejor[0],
-                                 "mediana_dif": round(mejor[1], 2),
-                                 "horas_comunes": mejor[2]}
-            if cotejo:
-                out["cotejo_euskadi"] = cotejo
-                lags = {c["lag_h"] for c in cotejo.values()}
-                out["cotejo_nota"] = (
-                    "lag_h=0 en todas las métricas: las horas están alineadas."
-                    if lags == {0} else
-                    "ATENCIÓN: lag_h != 0 — ajusta EEA_HOUR_OFFSET a ese valor "
-                    "y reinicia; las dos fuentes sirven las mismas cabinas, "
-                    "así que el desfase es de etiquetado, no de aire.")
+            out["cotejo_euskadi"] = eea.cotejo_con(euskadi, hours, lat, lon)
     except Exception as e:
         out["cotejo_error"] = str(e)
+    return jsonify(out)
+
+def _rho_spearman(a, b):
+    """Spearman robusto: None si no hay varianza o sale NaN."""
+    if len(a) < 3 or len(set(a)) < 2 or len(set(b)) < 2:
+        return None
+    r, _p = sps.spearmanr(a, b)
+    return None if r != r else float(r)
+
+
+def _lag_scan_series(sens, ref, lags=tuple(range(-3, 4)), min_n=48,
+                     n_boot=200, semilla=0):
+    """
+    Correla la serie horaria de los sensores ({hora: valor}) con una
+    referencia oficial desplazada 'lag' horas: la hora h del sensor se
+    empareja con ref[h + lag]. El maximo de correlacion cae en la alineacion
+    buena; lag > 0 significa que la referencia etiqueta el mismo aire 'lag'
+    horas MAS TARDE que los sensores.
+
+    Se calcula sobre niveles y sobre DIFERENCIAS hora a hora. Los niveles de
+    PM varian despacio y, desplazados una hora, se siguen pareciendo mucho:
+    su maximo sale romo. Las diferencias quitan la tendencia lenta y dejan un
+    maximo mas nitido; son el criterio cuando hay datos para calcularlas.
+
+    INCERTIDUMBRE. Con n ~ 330 horas el error tipico de una rho es ~0,055, y
+    los margenes entre desfases contiguos suelen ser menores. La primera
+    version decidia con un umbral de margen fijo (0,02) y en produccion dio
+    'hora_buena' a partir de una sola metrica con margen 0,07: ruido. Ahora
+    se remuestrean DIAS completos (bootstrap por bloques: respeta la
+    autocorrelacion dentro del dia) n_boot veces y se cuenta cuantas gana
+    cada desfase. 'estabilidad' es la fraccion de remuestreos en que gana el
+    mejor; por debajo de 0,8 la metrica no vota.
+    """
+    res, pares_dif, pares_niv = {}, {}, {}
+    for lag in lags:
+        d = lag * 3600
+        hs = sorted(h for h in sens if (h + d) in ref)
+        if len(hs) < min_n:
+            continue
+        niv = [(h // 86400, sens[h], ref[h + d]) for h in hs]
+        dif = [(h // 86400, sens[h + 3600] - sens[h],
+                ref[h + 3600 + d] - ref[h + d]) for h in hs
+               if (h + 3600) in sens and (h + 3600 + d) in ref]
+        pares_niv[lag], pares_dif[lag] = niv, dif
+        res[lag] = {"n": len(hs),
+                    "rho_niveles": _rho_spearman([p[1] for p in niv],
+                                                 [p[2] for p in niv]),
+                    "rho_diferencias": (
+                        _rho_spearman([p[1] for p in dif], [p[2] for p in dif])
+                        if len(dif) >= min_n else None)}
+    validos = {k: v for k, v in res.items() if v["rho_niveles"] is not None}
+    if not validos:
+        return None
+    usar_dif = all(v["rho_diferencias"] is not None for v in validos.values())
+    criterio = "rho_diferencias" if usar_dif else "rho_niveles"
+    pares = pares_dif if usar_dif else pares_niv
+    mejor = max(validos, key=lambda k: (validos[k][criterio], -abs(k)))
+    orden = sorted((v[criterio] for v in validos.values()), reverse=True)
+
+    # bootstrap por dias
+    por_dia = {lag: {} for lag in validos}
+    for lag in validos:
+        for dia, a, b in pares[lag]:
+            por_dia[lag].setdefault(dia, []).append((a, b))
+    dias = sorted(set().union(*(set(x) for x in por_dia.values())))
+    gana = {lag: 0 for lag in validos}
+    rng = np.random.default_rng(semilla)
+    validas = 0
+    if len(dias) >= 5:
+        for _ in range(n_boot):
+            muestra = rng.choice(dias, size=len(dias), replace=True)
+            mejor_b, rho_b = None, None
+            for lag in validos:
+                pa = [p for dia in muestra for p in por_dia[lag].get(dia, ())]
+                if len(pa) < min_n:
+                    continue
+                rho = _rho_spearman([p[0] for p in pa], [p[1] for p in pa])
+                if rho is not None and (rho_b is None or rho > rho_b or (
+                        rho == rho_b and abs(lag) < abs(mejor_b))):
+                    mejor_b, rho_b = lag, rho
+            if mejor_b is not None:
+                gana[mejor_b] += 1
+                validas += 1
+    estabilidad = (gana[mejor] / validas) if validas else None
+
+    r = lambda x: None if x is None else round(x, 3)
+    return {"mejor_lag_h": mejor, "criterio": criterio,
+            "rho_mejor": r(validos[mejor][criterio]),
+            "rho_en_lag_0": r((validos.get(0) or {}).get(criterio)),
+            "margen": r(orden[0] - orden[1]) if len(orden) > 1 else None,
+            "estabilidad": r(estabilidad),
+            "bootstrap": {str(k): r(v / validas) for k, v in sorted(gana.items())
+                          if validas and v},
+            "dias": len(dias),
+            "rho_niveles_mejor": r(validos[mejor]["rho_niveles"]),
+            "rho_niveles_lag_0": r((validos.get(0) or {}).get("rho_niveles")),
+            "por_lag": {str(k): {"n": v["n"],
+                                 "rho_niveles": r(v["rho_niveles"]),
+                                 "rho_diferencias": r(v["rho_diferencias"])}
+                        for k, v in sorted(res.items())}}
+
+
+def _veredicto_lag(por_metrica, offset_actual, variable,
+                   rho_min=0.15, estabilidad_min=0.8, votos_min=2):
+    """
+    Consenso de una fuente. Solo vota una metrica cuyo mejor desfase gana en
+    al menos el 80 % de los remuestreos por dias; y hacen falta al menos dos
+    metricas de acuerdo para dictaminar. Con un solo voto es un 'indicio',
+    no un veredicto: la primera version dio 'hora_buena' con un voto de
+    margen 0,07, que estaba dentro del error.
+    """
+    votos = {m: r["mejor_lag_h"] for m, r in por_metrica.items()
+             if r["rho_mejor"] is not None and r["rho_mejor"] >= rho_min
+             and r.get("estabilidad") is not None
+             and r["estabilidad"] >= estabilidad_min}
+    out = {"votan": votos}
+    lags = sorted(set(votos.values()))
+    if not votos:
+        out["veredicto"] = "inconcluso"
+        out["nota"] = ("ninguna metrica fija su desfase en al menos el %d %% "
+                       "de los remuestreos por dias: los datos no deciden la "
+                       "hora. Prueba con ?hours=720 o con un sensor junto a "
+                       "una cabina (?mac=)." % round(estabilidad_min * 100))
+    elif len(lags) > 1:
+        out["veredicto"] = "inconsistente"
+        out["nota"] = ("las metricas que votan discrepan (%s): no toques "
+                       "nada." % lags)
+    elif len(votos) < votos_min:
+        out["veredicto"] = "indicio"
+        out["lag_h"] = lags[0]
+        out["nota"] = ("solo %d metrica fija su desfase (%+d h); hacen falta "
+                       "%d de acuerdo para dictaminar. No toques nada por esto."
+                       % (len(votos), lags[0], votos_min))
+    elif lags == [0]:
+        out["veredicto"] = "hora_buena"
+        out["nota"] = ("%d metricas casan con esta fuente sin desplazarla, "
+                       "cada una en al menos el %d %% de los remuestreos: su "
+                       "sellado horario es correcto."
+                       % (len(votos), round(estabilidad_min * 100)))
+    else:
+        L = lags[0]
+        out["veredicto"] = "desfasada"
+        out["lag_h"] = L
+        out["nota"] = ("%d metricas casan con esta fuente desplazada %+d h: "
+                       "etiqueta el aire %d h %s." % (
+                           len(votos), L, abs(L),
+                           "tarde" if L > 0 else "pronto"))
+        if offset_actual is not None:
+            out["nota"] += (" Se corrige con %s=%d (ahora %d)."
+                            % (variable, offset_actual - L, offset_actual))
+    return out
+
+
+@app.route("/lag-scan")
+@app.route("/lag-scan/<geo3>")
+def lag_scan(geo3=None):
+    """
+    ¿Que fuente oficial tiene bien la hora? Los sensores fechan en UTC desde
+    InfluxDB y son el arbitro INDEPENDIENTE: se correla su serie horaria con
+    cada fuente oficial desplazada de -3 a +3 h, y el maximo cae en la
+    alineacion buena.
+
+    Nace del cotejo EEA-Euskadi: las mismas cabinas, identicas al dato, salen
+    una hora mas tarde en la EEA. Eso dice que discrepan, no quien tiene
+    razon, y el sellado de euskadi.py (-1 h, version 1.0.0) se valido solo con
+    "subio el rho de PM2.5", corrigiendo a la vez un error de -23 h en la
+    hora 24 que por si solo ya lo habria subido.
+
+    SOLO LECTURA: lee la serie de la zona con fetch_zone_series y un filtro de
+    rango fisico, sin pasar por zone_statistics, que escribe en el historico
+    ESOD.
+    """
+    geo3 = geo3 or _primera_zona_activa()
+    hours = int(request.args.get("hours", 336))
+    # un sensor junto a una cabina sigue sus oscilaciones hora a hora mucho
+    # mejor que la mediana de la zona: mas senal para fechar
+    mac = request.args.get("mac") or None
+    raw = fetch_zone_series(geo3, hours, mac=mac)
+    if not raw:
+        return jsonify({"error": f"sin datos de sensores en {geo3}"}), 404
+    convert_gases(raw)
+    sens = {}
+    for m, (t, v) in raw.items():
+        if m not in METRICS:
+            continue
+        lo, hi = METRICS[m]["range"]
+        por_h = {}
+        for ti, vi in zip(t, v):
+            vi = float(vi)
+            if vi == vi and lo <= vi <= hi:
+                por_h.setdefault(int(ti // 3600) * 3600, []).append(vi)
+        if len(por_h) >= 48:
+            sens[m] = {h: sum(x) / len(x) for h, x in por_h.items()}
+
+    fuentes, offsets = {}, {}
+    off, _src, meta = fetch_official_any(geo3, hours, mac=mac)
+    prov = (meta or {}).get("provider")
+    if off and prov:
+        fuentes[prov] = off
+    if prov == "euskadi":
+        offsets["euskadi"] = (getattr(euskadi, "EUSKADI_HOUR_OFFSET", None),
+                              "EUSKADI_HOUR_OFFSET")
+    lat, lon, _n = zone_sensor_center(geo3, mac=mac)
+    if eea.EEA_ENABLED and lat is not None and prov != "eea":
+        try:
+            s_eea, _f = eea.fetch_official_series(hours, lat=lat, lon=lon)
+            if s_eea:
+                fuentes["eea"] = s_eea
+        except Exception as e:
+            log.warning("lag-scan: EEA no disponible en %s: %s", geo3, e)
+    if "eea" in fuentes:
+        offsets["eea"] = (eea.EEA_HOUR_OFFSET, "EEA_HOUR_OFFSET")
+
+    out = {"zone": geo3, "hours": hours, "mac": mac,
+           "metricas_sensor": sorted(sens), "fuentes": {}}
+    for nombre, ref in fuentes.items():
+        por_m = {}
+        for m in sorted(set(sens) & set(ref)):
+            r = _lag_scan_series(sens[m], ref[m])
+            if r:
+                por_m[m] = r
+        actual, variable = offsets.get(nombre, (None, None))
+        out["fuentes"][nombre] = {"metricas": por_m,
+                                  **_veredicto_lag(por_m, actual, variable)}
+
+    # coherencia con el cotejo estacion a estacion: alli la EEA salia +1 h
+    # respecto a euskadi; aqui lag(eea) - lag(euskadi) deberia dar lo mismo
+    fe, fu = out["fuentes"].get("eea"), out["fuentes"].get("euskadi")
+    datables = ("hora_buena", "desfasada")
+    if fe and fu and fe["veredicto"] in datables and fu["veredicto"] in datables:
+        out["diferencia_eea_menos_euskadi_h"] = (fe.get("lag_h", 0)
+                                                 - fu.get("lag_h", 0))
     return jsonify(out)
 
 @app.route("/official-sources")

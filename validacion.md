@@ -535,6 +535,50 @@ factor se publica marcado `incierto`.
 
 ---
 
+## 10. Un módulo de respaldo tumbó el servicio
+
+**Qué pasó.** La primera versión de `eea.py` pedía los datos con
+`POST /ParquetFile`: un ZIP con **todos** los ficheros del país. Para tres
+días de España eso son **2310 ficheros y ~220 MB** (medido con
+`/DownloadSummary`), que el código cargaba entero en memoria con
+`r.content`… para acabar usando las dos o tres estaciones a menos de 25 km
+de la zona. En el primer `/eea-debug` real, el servidor tardó más que el
+`timeout` del cliente con el hilo de Flask bloqueado, el healthcheck de
+Docker se quedó sin respuesta (hueco de 35 s entre dos `GET /health` en el
+log) y el contenedor se reinició a mitad de la petición
+(`RestartCount=1`; `dmesg` limpio: no fue memoria, fue el bloqueo).
+
+**Por qué es el caso más grave hasta ahora.** La cadena de referencia está
+pensada para degradar con elegancia: si una fuente falla, se pasa a la
+siguiente. Un eslabón de RESPALDO que puede tirar el proceso entero invierte
+esa lógica: añadirlo restaba fiabilidad en vez de sumarla.
+
+**Qué se hizo.**
+- Los datos se piden con `/ParquetFile/urls` (la LISTA de ficheros, unos KB
+  de texto) y se descargan **solo los de las estaciones elegidas**: un
+  parquet por punto de muestreo, ~100 kB cada uno. De 220 MB a menos de 1 MB.
+- El emparejamiento fichero↔estación usa el id del punto y, de respaldo, el
+  **código nacional de estación** que el nombre del fichero lleva dentro
+  (`SP_01055001_9_49.parquet`), porque el id del metadato no tiene por qué
+  coincidir con el del blob. Si no casa nada, se avisa en el log con
+  ejemplos de los dos lados: el fallo silencioso es el enemigo aquí.
+- Los datos vuelven **agrupados por estación**, decididos por quien eligió
+  el fichero. La primera corrección emparejaba al elegir y volvía a cruzar
+  ids al leer: la serie de una estación emparejada por código nacional salía
+  vacía, en silencio. Lo cazó la prueba D1 (promedio 10 en vez de 15).
+- Streaming a disco, filtrado temporal AL PARSEAR (cada fichero trae el
+  histórico completo del punto desde 2023), y topes `EEA_MAX_FILES` /
+  `EEA_MAX_MB`: si algún día la lista se dispara, el módulo se aparta y la
+  cadena sigue a CAMS.
+
+**Verificación en el servidor.** `bash scripts/sonda-eea.sh` comprueba el
+metadato (descarga, formato ZIP, columnas); `curl localhost:5000/eea-debug/ezt`
+coteja la serie EEA contra Euskadi —sirven las mismas cabinas— y publica
+`lag_h` por métrica: 0 = horas alineadas; ±1 se corrige con
+`EEA_HOUR_OFFSET`.
+
+---
+
 ---
 
 ## Cambios en la web (`index.html`)

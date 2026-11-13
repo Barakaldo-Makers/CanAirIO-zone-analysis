@@ -28,12 +28,22 @@ fetch_official_any(geo3, hours)
         │
         ├─ 1. euskadi.py   ¿hay estación vasca a menos de 25 km?  → la usa
         ├─ 2. openaq.py    ¿hay estación oficial a menos de 25 km? → la usa
-        └─ 3. (ninguna)    → queda CAMS, como antes
+        ├─ 3. eea.py       ¿hay estación EEA a menos de 25 km?    → la usa
+        └─ 4. (ninguna)    → queda CAMS, como antes
 ```
 
 La confianza final de cada métrica sigue siendo la mejor correlación entre CAMS
 y la referencia oficial, y ahora anota cuál ganó: `source` vale `euskadi`,
-`openaq` o `cams`.
+`openaq`, `eea` o `cams`.
+
+`eea.py` va detrás de OpenAQ a propósito: para Europa sirven las mismas
+cabinas y la vía de OpenAQ estaba probada antes. Su papel es la redundancia
+con fuente primaria: la red vasca reporta a la EEA, así que si Open Data
+Euskadi se cae, la EEA toma el relevo con los mismos datos, en las mismas
+unidades y a la misma hora (verificado cabina a cabina con `/eea-debug`).
+Lo que costó llegar ahí —un módulo de respaldo que tumbaba el servicio, una
+CPU de 2007 sin SSE4.2 y una hora de diferencia entre las dos fuentes— está
+en [`VALIDACION.md`, caso 10](VALIDACION.md#10-un-módulo-de-respaldo-tumbó-el-servicio).
 
 ### Por qué el centroide y no el centro del geohash
 

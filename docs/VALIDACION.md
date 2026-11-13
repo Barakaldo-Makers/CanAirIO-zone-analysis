@@ -489,6 +489,262 @@ este método, y PM2.5 es precisamente la métrica fiable de este despliegue.
 
 ---
 
+## 9. El factor de corrección era un cociente de dos medias
+
+**Qué pasaba.** El factor de PM se calculaba como
+`reference_mean / sensor_mean`: se usaban las ~46 parejas horarias de la
+ventana para calcular dos números y dividirlos. Un cociente de dos medias
+pequeñas (PM2.5 de zona limpia ronda los 5 µg/m³) tiene una varianza relativa
+enorme, y además la media es ilimitadamente sensible a las horas de episodio
+local que la cabina no ve: cada pico del sensor infla `sensor_mean` y hunde el
+factor **justo los días en que la corrección más importa**.
+
+**Cómo se vio.** En el despliegue real el factor diario de `ezt` pasó de
++23,5 % (pm10) y +17,9 % (pm25) el 15 de octubre a **−17,5 % y −20,4 % el
+19**, sin que cambiara nada físico: una deriva real no invierte el signo en
+cuatro días. Y la banda del detector de deriva salía `[0.087, 3.707]` —42
+veces más ancha que el propio factor— porque medía el ruido del estimador, no
+el sensor. La cobertura no era la causa: 45–46 de las 48 horas de la ventana
+estaban emparejadas (94–96 %).
+
+**Qué se hizo.** El factor es ahora la **mediana de los cocientes horarios**
+`referencia/sensor`, con IC 95 % por estadísticos de orden (sin supuestos de
+distribución). Medido con simulación (`tests/experimento_estimadores.py`),
+contra el mecanismo real —episodios locales en número variable, Poisson—:
+
+```
+                    cociente de medias    mediana de cocientes
+ruido limpio          sd 0.059  ses +0.00   sd 0.065  ses -0.00
+episodios Poisson     sd 0.164  ses -0.15   sd 0.065  ses -0.01
+nivel bajo + picos    sd 0.197  ses -0.13   sd 0.072  ses -0.03
+```
+
+Empate donde el cociente es óptimo, 2,3–2,7 veces menos ruido y sin sesgo
+donde no lo es. La mediana **ponderada** por nivel también se probó y se
+descartó con datos: el peso es el propio valor del sensor, así que un pico se
+auto-asigna el peso máximo y vuelve a colarse.
+
+**La lección de la mezcla, otra vez.** Cambiar el estimador dentro de
+`pm_factor_<m>` habría mezclado dos definiciones en una serie, igual que antes
+se mezclaban dos bases (caso 8). El estimador nuevo se guarda en
+`pm_factor_med_<m>` (con su IC en `pm_fci_lo/hi_<m>`), el campo antiguo
+conserva su definición, y el detector de deriva se pasa a la serie nueva
+cuando acumula `DRIFT_MIN_DAYS` días, anunciándolo en `estimador` y en la
+nota. Si el IC de un día es más ancho que `PM_FACTOR_CI_MAX` (sup/inf), el
+factor se publica marcado `incierto`.
+
+---
+
+## 10. Un módulo de respaldo tumbó el servicio
+
+**Qué pasó.** La primera versión de `eea.py` pedía los datos con
+`POST /ParquetFile`: un ZIP con **todos** los ficheros del país. Para tres
+días de España eso son **2310 ficheros y ~220 MB** (medido con
+`/DownloadSummary`), que el código cargaba entero en memoria con
+`r.content`… para acabar usando las dos o tres estaciones a menos de 25 km
+de la zona. En el primer `/eea-debug` real, el servidor tardó más que el
+`timeout` del cliente con el hilo de Flask bloqueado, el healthcheck de
+Docker se quedó sin respuesta (hueco de 35 s entre dos `GET /health` en el
+log) y el contenedor se reinició a mitad de la petición
+(`RestartCount=1`; `dmesg` limpio: no fue memoria, fue el bloqueo).
+
+**Por qué es el caso más grave hasta ahora.** La cadena de referencia está
+pensada para degradar con elegancia: si una fuente falla, se pasa a la
+siguiente. Un eslabón de RESPALDO que puede tirar el proceso entero invierte
+esa lógica: añadirlo restaba fiabilidad en vez de sumarla.
+
+**Qué se hizo.**
+- Los datos se piden con `/ParquetFile/urls` (la LISTA de ficheros, unos KB
+  de texto) y se descargan **solo los de las estaciones elegidas**: un
+  parquet por punto de muestreo, ~100 kB cada uno. De 220 MB a menos de 1 MB.
+- El emparejamiento fichero↔estación usa el id del punto y, de respaldo, el
+  **código nacional de estación** que el nombre del fichero lleva dentro
+  (`SP_01055001_9_49.parquet`), porque el id del metadato no tiene por qué
+  coincidir con el del blob. Si no casa nada, se avisa en el log con
+  ejemplos de los dos lados: el fallo silencioso es el enemigo aquí.
+- Los datos vuelven **agrupados por estación**, decididos por quien eligió
+  el fichero. La primera corrección emparejaba al elegir y volvía a cruzar
+  ids al leer: la serie de una estación emparejada por código nacional salía
+  vacía, en silencio. Lo cazó la prueba D1 (promedio 10 en vez de 15).
+- Streaming a disco, filtrado temporal AL PARSEAR (cada fichero trae el
+  histórico completo del punto desde 2023), y topes `EEA_MAX_FILES` /
+  `EEA_MAX_MB`: si algún día la lista se dispara, el módulo se aparta y la
+  cadena sigue a CAMS.
+
+**El desenlace, que no era ninguna de las dos hipótesis.** Con la descarga
+ya arreglada, el proceso siguió muriendo: siempre ~4 s después de construir
+el índice, sin traceback, con `dmesg` limpio. El número que faltaba estaba
+en `docker events`: **`exitCode=132` = SIGILL, instrucción ilegal**. Los
+binarios oficiales de **pyarrow se compilan exigiendo SSE4.2** (CPUs de 2008
+en adelante) sin comprobarlo en tiempo de ejecución, y el servidor es un
+Core 2 Quad Q6600 de 2007: al primer uso de la librería, el kernel mata el
+proceso. numpy y scipy llevan meses en esa máquina sin quejarse porque
+eligen su ruta SIMD al arrancar; Arrow no lo hace. La primera respuesta fue
+una guarda: mirar `/proc/cpuinfo` antes de importar pyarrow y usar
+**fastparquet** sin SSE4.2. La guarda funcionó —el log dijo «se usa
+fastparquet»— y el proceso murió igual, otro `exitCode=132`: **fastparquet
+también trae instrucciones ilegales** para esa CPU.
+
+El primer diagnóstico de esa segunda muerte fue erróneo y conviene dejarlo
+escrito. Un triaje dentro del contenedor (`import numpy`, `pandas`,
+`cramjam`, `fastparquet` uno a uno) señaló a fastparquet, y la hipótesis fue
+«su wheel está compilada para CPUs modernas; compilado del fuente en la
+propia máquina saldrá genérico». Antes de mandar al servidor un build largo
+se probó **emulando la CPU con QEMU** (`qemu-x86_64 -cpu Conroe`, la
+microarquitectura del Q6600): el control reprodujo el triaje al milímetro
+—numpy, pandas y cramjam arrancan, fastparquet de wheel muere con 132— y el
+fastparquet **compilado del fuente murió igual**. `-X importtime` señaló la
+extensión `fastparquet.cencoding`, y el `setup.py` explicó por qué: desde la
+**2026.5.0** fuerza `-march=x86-64-v2` siempre que el *compilador* acepte la
+opción, sin mirar la *CPU*. Compilarlo en el propio Q6600 habría producido
+el mismo binario roto. Revisando los `setup.py` de cada versión publicada, la
+**2025.12.0** es la última genérica, y la 2026.3.0 —que es la que resuelve
+pip con `fastparquet<2026.5` para Python 3.11— arranca en Conroe y lee, con
+el lector hijo literal de `eea.py`, parquets con el esquema de la EEA en los
+cuatro códecs (snappy, zstd, gzip, sin comprimir). De ahí el pin en
+`requirements.txt`.
+
+La lección de método: con una CPU antigua, **QEMU en modo usuario reproduce
+un SIGILL en segundos y sin tocar producción**. Cada hipótesis de esta
+noche que no se midió fue falsa; las que se midieron, no.
+
+Pero un pin se puede subir sin querer. La protección de fondo: **la
+lectura de parquet corre en un subproceso**.
+Una instrucción ilegal mata al hijo con código −4; el padre lo ve, veta ese
+motor en esa máquina, lo cuenta en el log (`/eea-debug` lo publica en
+`lectores_vetados`) y prueba el siguiente; si ninguno sobrevive, la EEA se
+queda honradamente sin datos y la cadena sigue a CAMS. El hijo además filtra
+por ventana temporal y devuelve solo esas filas en JSON, así que el aislante
+sale casi gratis. La lección operativa, ahora de verdad: *un import no tiene
+permiso para matar el proceso* — y eso no se garantiza con listas de CPUs,
+se garantiza con aislamiento. Las pruebas F1–F3 cubren el motor alternativo
+(idéntico resultado) y la muerte por señal de todos los motores. Y quedó
+probado en producción antes que en el papel: con el fastparquet malo
+instalado, `/eea-debug` respondió con `lectores_vetados: ["fastparquet"]`
+en lugar de tumbar el contenedor.
+
+**El primer cotejo contra Euskadi: dos hallazgos y una recomendación
+falsa.** Con el lector ya funcionando en el Q6600 (9 estaciones, 6
+métricas, 42 h, 4 MB), `/eea-debug` comparó la serie EEA con la de Open
+Data Euskadi. Comparaba los **promedios** de cada fuente, y eso fue un error
+de diseño: la EEA promediaba hasta 8 cabinas a 25 km y Euskadi su propia
+selección, así que salían desfases de −2 a +2 h según la métrica. Un error
+de etiquetado horario sería **el mismo para todas**; esa dispersión solo
+decía que se comparaban cosas distintas. La nota del endpoint recomendaba
+ajustar `EEA_HOUR_OFFSET`, y hacerle caso habría sido romper algo que no
+estaba roto.
+
+Pero entre el ruido había dos señales reales:
+
+- **CO: `mediana_dif` 169,86.** El proyecto guarda el CO en mg/m³
+  (`euskadi.py` y `openaq.py` lo documentan), y `eea.py` era el único
+  proveedor que lo pasaba a µg/m³. Si la EEA hubiera tomado el relevo de
+  Euskadi, la referencia de CO habría salido mil veces alta, y con ella el
+  factor de corrección y las alertas.
+- **O₃: `mediana_dif` 0,0 exacto con 1 h de desfase.** Cuarenta y una horas
+  idénticas al dato no son casualidad: son las mismas cabinas, etiquetadas
+  una hora más tarde.
+
+**Qué se hizo, y qué hipótesis cayó.** El CO va en mg/m³ como en el resto
+de proveedores. Para el O₃, la primera explicación fue la zona horaria: la
+documentación de la EEA no dice en qué zona va `Start` (formato
+`yyyy-mm-dd H:M:S`, sin desfase), y el metadato declara una por estación
+(`UTC+01` en Andorra). Se implementó leer la hora sin zona en la zona de su
+estación (`EEA_TZ_MODE=metadato`), y el cotejo se rehízo para comparar **la
+misma cabina por los dos caminos**: cada estación vasca con la EEA en su
+mismo sitio, serie contra serie.
+
+El resultado tumbó la hipótesis y dejó un hallazgo más limpio. Seis cabinas
+emparejadas a 1–4 m, veintitrés comparaciones, **todas idénticas al dato**,
+y el metadato declara **UTC** para todas (`tz_declarada_h: 0.0`): la zona
+horaria no explicaba nada. Lo que quedaba era uniforme: CO, NO₂, O₃, PM10 y
+PM2,5 salían **+1 h en las seis cabinas, sin una excepción**. El SO₂ daba
+−3 h, pero era un artefacto: sus series son casi planas (enteros de 1 a 5
+µg/m³), todos los desfases empatan a diferencia cero y la función se quedaba
+con el primero que probaba. Ahora un empate se marca `fechable: false` y no
+vota.
+
+**Y lo que ese +1 no puede decir.** Que dos fuentes discrepen en una hora no
+dice cuál de las dos tiene razón. La nota del cotejo habría recomendado
+`EEA_HOUR_OFFSET=-1`, dando por hecho que `euskadi.py` está bien. Pero su
+sellado (−1 h, sección «Sellado horario del CSV vasco») se validó con «el rho
+de PM2.5 subió», corrigiendo **a la vez** un error de −23 h en la hora 24
+que por sí solo ya habría subido el rho. La hora en sí nunca se aisló. Si la
+que se equivoca es `euskadi.py`, la referencia de `ezt` lleva desde la 1.0.0
+emparejada con una hora de desfase contra los sensores: afecta al rho, al
+factor de corrección y al detector de deriva.
+
+El árbitro tiene que ser independiente de las dos fuentes: **los propios
+sensores**, que fechan en UTC desde InfluxDB. `/lag-scan` correla la serie
+horaria de la zona con cada fuente oficial desplazada de −3 a +3 h, y el
+máximo cae en la alineación buena. Correla niveles y, sobre todo,
+**diferencias hora a hora**: los niveles de PM varían despacio y su máximo
+sale romo, mientras que las diferencias quitan la tendencia y lo afilan (en
+la prueba H4, margen 0,712 frente a 0,110). Solo votan las métricas con
+correlación y margen suficientes, y el endpoint es de solo lectura: no pasa
+por `zone_statistics`, que escribe en el histórico ESOD.
+
+**El primer barrido, y por qué no decidió nada.** Catorce días sobre la zona
+`ezt` (n ≈ 330 horas). Cada métrica reprodujo por su cuenta la hora de
+diferencia entre fuentes (PM2,5: Euskadi 0, EEA +1; PM10: Euskadi −1, EEA
+0), pero en sentidos opuestos sobre quién tiene razón, y con márgenes de
+0,012 a 0,07 entre desfases contiguos. El error típico de una rho con
+n = 330 ronda 1/√330 ≈ 0,055: **todos esos márgenes están dentro del
+ruido**. La herramienta, aun así, dictaminó `hora_buena` para la EEA con un
+solo voto de margen 0,07, porque decidía con un umbral fijo (0,02) puesto
+sin pensar en el error de muestreo.
+
+Se rehízo con **remuestreo por días** (*bootstrap* por bloques, 200
+repeticiones, que respeta la autocorrelación dentro del día): una métrica
+solo vota si su mejor desfase gana en al menos el 80 % de los remuestreos, y
+hacen falta dos de acuerdo para dictaminar. Medido en simulación con la
+verdad en lag 0:
+
+```
+ruido del sensor   rho de diferencias   margen   gana el mejor   mejor lag
+      1,0                0,42           0,081        97 %           0
+      2,0                0,22           0,027        68 %           0
+      4,0                0,10           0,004        42 %          −1
+```
+
+La fila de ruido 2,0 es el régimen de producción: la estimación acierta,
+pero solo en dos de cada tres remuestreos, así que no vota. La de ruido 4,0
+enseña el peligro que evita: la estimación puntual sale **equivocada** y el
+umbral fijo la habría podido votar.
+
+**La decisión, que no depende de los sensores.** El desfase relativo es
+seguro: 23 comparaciones idénticas al dato, seis cabinas, cinco métricas,
+ninguna excepción. Quién tiene razón lo decide el propio formato: el CSV
+vasco etiqueta las horas de **01:00 a 24:00** (la 1.0.0 tuvo que corregir
+un fallo con la hora «24», así que no es una suposición), y una etiqueta
+«24:00» solo puede ser el final de una hora. Sellar al inicio con −1 es
+correcto, y la EEA está tomando ese final de hora como `Start`. La métrica
+con mejor correlación, PM2,5, apunta en el mismo sentido sin ser
+concluyente. Y hay una razón práctica independiente de quién tenga razón:
+la EEA es el **respaldo** de Euskadi, y si tomara el relevo con una hora de
+diferencia la referencia saltaría una hora en silencio. Por todo ello,
+`EEA_HOUR_OFFSET=-1`. El valor está medido para la red vasca: una zona
+europea nueva con red local propia se comprueba con el mismo cotejo.
+
+Lo que estaba en juego, por cierto, era poco: el rho de PM2,5 en niveles
+pasa de 0,872 a 0,838 o 0,877 al mover una hora, y la mediana de cocientes
+horarios del factor apenas se inmuta. La alarma inicial —«si el sellado de
+Euskadi estuviera mal, afectaría al rho, al factor y a la deriva»— era
+cierta en la dirección y exagerada en la magnitud.
+
+**Verificación en el servidor.** `bash scripts/sonda-eea.sh` comprueba el
+metadato (descarga, formato ZIP, columnas); `curl localhost:5000/eea-debug/ezt`
+publica el bloque `descarga` (URLs en el país, casadas, bajadas, lector) y el
+`cotejo_euskadi`, que mide el desfase **relativo** entre las dos fuentes
+(`alineado`, `desfase_relativo`, `no_fechable`, `inconcluso`,
+`inconsistente` o `sin_parejas`) sin recomendar ajustes. `curl localhost:5000/lag-scan/ezt` correla los sensores con cada fuente
+y dice por fuente `hora_buena`, `desfasada`, `indicio`, `inconsistente` o
+`inconcluso`, con la `estabilidad` de cada métrica en el remuestreo por días;
+`?mac=` lo hace con un solo sensor, que si está junto a una cabina da mucha
+más señal que la mediana de la zona.
+
+---
+
 ---
 
 ## Cambios en la web (`index.html`)
@@ -555,6 +811,13 @@ REF_HIST_DAYS=180
 
 # Avisos
 ALERT_PERSIST_H=2      # antes 1, que desactivaba la persistencia
+
+# Estimador del factor de PM (caso 9)
+PM_FACTOR_MIN_RATIOS=12  # cocientes horarios mínimos para la mediana
+PM_FACTOR_CI_MAX=1.5     # IC95 sup/inf mayor que esto = factor 'incierto'
+
+# Acústica: franja de indecisión de los veredictos
+ACU_LIMITE_DB=2.0      # a menos de esto del límite, 'en_el_limite'
 ```
 
 ---

@@ -30,6 +30,9 @@ estática de GitHub Pages y en avisos de Telegram.
 │   ├── app.py                   ← TODO el motor de análisis (~2.600 líneas)
 │   ├── euskadi.py               ← red oficial vasca, selección automática
 │   ├── openaq.py                ← referencia oficial GLOBAL (OpenAQ v3)
+│   ├── eea.py                   ← referencia oficial EUROPEA (Agencia Europea de Medio Ambiente)
+│   ├── acustica.py              ← indicadores acústicos (Lden, Ld/Le/Ln, L90)
+│   ├── narrador.py              ← redacción vía API remota, con verificador de cifras
 │   ├── publisher.py             ← exporta JSON y hace git push
 │   ├── requirements.txt
 │   └── Dockerfile
@@ -126,7 +129,7 @@ Todo ocurre en `app.py`. Orden de ejecución dentro de `zone_statistics()` y
 | 6 | `fetch_weather()` | Open-Meteo: temperatura, humedad, viento, **weathercode**, nubosidad, visibilidad, UV |
 | 7 | `fetch_reference()` | CAMS/Copernicus (cobertura global) |
 | 8 | `zone_sensor_center()` | Posición real de los sensores (la celda geo3 mide 156 km). Con `mac`, la de ESE sensor |
-| 8b | `fetch_official_any()` | Cadena de referencia oficial: red vasca (por cercanía + cobertura de métricas) → OpenAQ global → nada |
+| 8b | `fetch_official_any()` | Cadena de referencia oficial: red vasca (por cercanía + cobertura de métricas) → OpenAQ global → EEA (Europa; respaldo de la red local) → nada |
 | 9 | `build_confidence()` + `merge_confidence()` | Etiqueta por métrica tomando el **mejor veredicto** (no el mejor rho); empate a favor de la cabina oficial |
 | 10 | `pm_corrections()` / `apply_malm_correction()` | Corrección PM. Jerarquía: cabina oficial > Malm (humedad) > nada. CAMS nunca se aplica. Publica `applied_*` con una sola cifra |
 | 11 | `cross_sensor_validation()` | Cada sensor vs la mediana de sus vecinos |

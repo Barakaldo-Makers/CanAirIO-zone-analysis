@@ -53,7 +53,9 @@ otros cinco del mismo estilo.
 - **Cadena de referencia oficial.** Para cada zona (o cada sensor individual)
   se calcula su posición real y se busca una cabina de referencia a menos de
   25 km: primero una red local, luego [OpenAQ](https://openaq.org) a escala
-  mundial, y CAMS/Copernicus solo como último recurso.
+  mundial, luego la [Agencia Europea de Medio Ambiente](https://www.eea.europa.eu/)
+  en toda Europa (que además respalda a la red local y se coteja con ella
+  dato a dato), y CAMS/Copernicus solo como último recurso.
 - **Etiquetas de confianza por métrica,** a partir de la correlación de
   Spearman y el sesgo relativo contra esa referencia, tomando el *mejor
   veredicto* y no simplemente la mejor correlación.
@@ -146,6 +148,10 @@ Para tener cabinas reales fuera de una red local soportada, saca una
 | `GET /compare/<geo3>` · `/compare-official/<geo3>` | vs CAMS · vs cabinas oficiales |
 | `GET /official-sources` | qué referencia usa cada zona activa |
 | `GET /openaq-debug[/<geo3>]` · `/euskadi-debug[/<geo3>]` | diagnóstico de referencias |
+| `GET /eea-debug[/<geo3>]` | referencia EEA: estaciones, traza de la descarga, cotejo estación a estación con la red local |
+| `GET /lag-scan[/<geo3>]` | qué referencia tiene la hora buena: sensores contra cada fuente desplazada −3..+3 h, con remuestreo por días |
+| `GET /acustica[/<geo3>]` | indicadores acústicos de largo plazo frente al RD 1367/2007 y la OMS 2018 |
+| `GET /narrativa/<geo3>` | resumen en lenguaje llano vía API remota (apagado por defecto) |
 | `GET /esod-debug/<geo3>` | antes/después del filtrado y estado del histórico |
 | `GET /drift[/<geo3>]` · `/ref-history[/<geo3>]` | deriva del factor · historial de cabina |
 | `GET /run-cycle` · `/publish` | fuerza un ciclo · fuerza la publicación |

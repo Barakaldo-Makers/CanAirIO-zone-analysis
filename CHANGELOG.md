@@ -11,7 +11,34 @@ Versionado semántico.
   clave). Tercer eslabón de la cadena: euskadi → OpenAQ → **EEA** → CAMS. La
   red vasca reporta a la EEA, así que es el respaldo automático de
   `euskadi.py` si Open Data Euskadi se cae, y cubre cualquier zona europea
-  futura sin escribir un módulo por país. Las coordenadas de estación salen
+  futura sin escribir un módulo por país. Los datos se bajan **fichero a
+  fichero y solo los de las estaciones elegidas**: se pide la lista de URLs
+  (`/ParquetFile/urls`, unos KB de texto), se eligen las de los puntos
+  cercanos —por id, y por código nacional de estación como respaldo, porque
+  el id del metadato no tiene por qué coincidir con el del fichero— y se
+  descargan en streaming a disco, con topes `EEA_MAX_FILES`/`EEA_MAX_MB` y
+  filtrado temporal al parsear. Los datos vuelven agrupados por estación,
+  para que nadie tenga que volver a cruzar identificadores.
+  El primer despliegue en el servidor (antes de publicarse aquí) usaba
+  `POST /ParquetFile` a secas: un ZIP con TODO el país —2310 ficheros y
+  ~220 MB para tres días de España— cargado en memoria con `r.content`, y
+  **tumbó el contenedor** con el hilo de Flask bloqueado. Y el segundo
+  incidente no era ni memoria ni timeout: los binarios de **pyarrow exigen
+  SSE4.2** y en una CPU anterior (el servidor es un Core 2 Quad de 2007)
+  matan el proceso con **SIGILL, exit 132**, al primer uso y sin traceback.
+  Y fastparquet **también** murió con SIGILL: desde la **2026.5.0** su
+  `setup.py` fuerza `-march=x86-64-v2` siempre que el compilador lo acepte,
+  sin mirar la CPU, así que ni compilarlo del fuente lo arregla. Se fija
+  **`fastparquet<2026.5`** (verificado bajo QEMU con CPU Core 2 *Conroe*:
+  numpy, pandas, cramjam y fastparquet 2026.3.0 arrancan; 2026.5.0 en
+  adelante y pyarrow mueren). Y como la protección no puede depender de un
+  pin, **la lectura de parquet corre en un subproceso** — una instrucción
+  ilegal mata al hijo (código −4), el padre veta ese motor, lo publica en
+  `/eea-debug` (`lectores_vetados`) y el servicio sigue intacto pase lo que
+  pase. Verificado también en producción: con el fastparquet malo dentro,
+  `/eea-debug` respondió con `lectores_vetados: ["fastparquet"]` en vez de
+  caerse. pyarrow es opcional y se prefiere cuando la CPU lo aguanta. Detalle de todo en
+  [`docs/VALIDACION.md`](docs/VALIDACION.md#10-un-módulo-de-respaldo-tumbó-el-servicio). Las coordenadas de estación salen
   del metadato del AQViewer (la API de descargas no las da): es un **ZIP con
   un CSV dentro** y **rechaza con 403 las peticiones sin User-Agent**; la URL
   está verificada contra la implementación del paquete R `EEAaq` (CRAN). Se
@@ -20,15 +47,53 @@ Versionado semántico.
   `Pollutant` y es la autoritativa, así que un cambio de nombre en esa columna
   del metadato ya no puede tumbar el módulo. Y queda `EEA_FORCE_SPOS` para
   fijar sampling points a mano si el metadato se mueve de sitio: con eso el
-  módulo funciona sin metadato y sin coordenadas. Unidades: µg/m³ pasa, mg/m³ se convierte (CO), cualquier otra
-  descarta la fila y se cuenta. `Validity < 1` se descarta. Nueva dependencia
-  **pyarrow**, solo para este módulo: si falta, `eea.py` se desactiva con un
-  error claro y el ciclo sigue.
-- Endpoint `/eea-debug[/<geo3>]` con **cotejo de alineación horaria contra
-  Euskadi**: las dos fuentes sirven las mismas cabinas, así que si el parquet
-  etiquetara la hora con otro criterio saldría aquí como `lag_h != 0`, y se
-  corrige con `EEA_HOUR_OFFSET` sin tocar código. `/official-sources` enseña
+  módulo funciona sin metadato y sin coordenadas. Unidades: las del sistema,
+  igual que `openaq.py` y `euskadi.py` —µg/m³ para todo salvo **CO, en
+  mg/m³**—; cualquier otra unidad descarta la fila y se cuenta.
+  `Validity < 1` se descarta. **Zona horaria por estación**: la EEA no
+  documenta en qué zona van `Start`/`End` (formato sin desfase), pero el
+  metadato declara una por estación (`Timezone`, p. ej. `UTC+01`); si el
+  parquet trae la hora sin zona se interpreta en la de su estación
+  (`EEA_TZ_MODE=metadato`, por defecto; `utc` para leerla como UTC). Un
+  desfase global no serviría en Europa: Portugal va a UTC+0, España a UTC+1
+  y Grecia a UTC+2.
+- Endpoint `/eea-debug[/<geo3>]` con **cotejo estación a estación contra
+  Euskadi**: cada cabina vasca se empareja con la estación EEA en su mismo
+  sitio (< 500 m) y se compara serie contra serie. Mide el desfase horario
+  **relativo** entre las dos fuentes y no recomienda ajustes: que discrepen
+  no dice cuál tiene razón. Una serie demasiado plana para fechar (SO₂ en
+  enteros bajos, que empata en todos los desfases) se marca
+  `fechable: false` y no vota. La primera versión comparaba los *promedios*
+  de cada fuente, que mezclan cabinas distintas, y su nota recomendaba
+  ajustar `EEA_HOUR_OFFSET`, lo que habría sido un error. Aun así cazó dos
+  cosas reales: **el CO salía mil veces alto** (`eea.py` lo pasaba a µg/m³
+  y el sistema lo usa en mg/m³; `mediana_dif` 169,86), y el O₃ coincidía
+  *exactamente* con una hora de desfase. El cotejo estación a estación lo
+  confirmó en seis cabinas y cinco métricas sin excepción: **la EEA etiqueta
+  los mismos valores 1 h más tarde que `euskadi.py`**. No era la zona
+  horaria: el metadato declara UTC para todas. `/official-sources` enseña
   `eea` como proveedor cuando es quien cubriría la zona.
+- **Endpoint `/lag-scan[/<geo3>]`: los sensores arbitran la hora.** Correla
+  la serie horaria de la zona con cada fuente oficial desplazada de −3 a
+  +3 h, sobre niveles y sobre diferencias hora a hora (estas afilan el
+  máximo seis veces en la prueba sintética). La incertidumbre se mide con
+  **remuestreo por días**: una métrica solo vota si su mejor desfase gana en
+  al menos el 80 % de 200 remuestreos, y hacen falta dos de acuerdo para
+  dictaminar (`hora_buena` o `desfasada`, con el valor exacto del ajuste);
+  con una sola es `indicio`. La primera versión decidía con un umbral de
+  margen fijo y en producción dio `hora_buena` a partir de un voto de margen
+  0,07, dentro del error típico (~0,055 con n = 330). `?mac=` barre un solo
+  sensor. Solo lectura: no pasa por `zone_statistics`, que escribe en el
+  histórico ESOD. Por defecto 14 días (`?hours=`).
+- **`EEA_HOUR_OFFSET=-1` para la red vasca.** La EEA publica los mismos
+  valores que Open Data Euskadi una hora más tarde (cotejo: 23
+  comparaciones idénticas al dato, sin excepción). El CSV vasco etiqueta de
+  01:00 a 24:00, así que su etiqueta es el final de la hora y el sellado
+  −1 de `euskadi.py` es correcto; la EEA toma ese final como `Start`. Los
+  sensores no lo deciden con 14 días (márgenes dentro del ruido), pero no
+  hace falta: el formato lo resuelve, y como la EEA es el respaldo de
+  Euskadi, alinearlas evita que la referencia salte una hora en silencio el
+  día que tome el relevo.
 - **El código de país se saca del código EoI, no del nombre.** El metadato
   trae una columna `Country` con el NOMBRE (`Spain`, `Andorra`), no el ISO, y
   la API de descargas exige códigos: recortar el nombre a dos letras daba
@@ -50,6 +115,28 @@ Versionado semántico.
   User-Agent. Sirve para resolver en dos minutos un cambio de URL sin tocar
   código.
 
+### Repositorio
+- **`scripts/pre-publish-check.sh` comprueba que cada `import` tiene su
+  fichero.** Dos veces se publicó un `app.py` que importaba un módulo nuevo
+  sin subir el módulo (`acustica` en la 1.3.0, `eea` en la 1.5.0): el
+  servidor funcionaba, porque allí los ficheros se copiaron a mano, y el
+  repo no arrancaba. Ahora todo import que no es de la biblioteca estándar
+  ni de `requirements.txt` tiene que ser un fichero de `ai-bridge/`, o el
+  audit falla. Además compila **todos** los `.py` (la lista fija de cuatro
+  dejaba fuera `eea.py`, `acustica.py` y `narrador.py`) y revisa también la
+  cabecera SPDX de `tests/`.
+- `docker-compose.yml`: `ALERT_PERSIST_H=2` (seguía a 1, que desactiva la
+  persistencia de avisos) y `EEA_HOUR_OFFSET=-1`.
+- `tests/test cambios.py` y `tests/esperimento estimadores.py` pasan a
+  `tests/test_cambios.py` y `tests/experimento_estimadores.py`: llevaban
+  espacios en el nombre, y el segundo una errata que rompía su enlace en
+  `docs/VALIDACION.md`. Se borra un `validacion.md` suelto en la raíz, copia
+  de la 1.4.0 subida fuera de `docs/`.
+- README (inglés y castellano), `docs/ARQUITECTURA.md` y
+  `docs/REFERENCIAS_OFICIALES.md` describen la cadena con la EEA y los
+  endpoints que faltaban: `/eea-debug`, `/lag-scan`, `/acustica` y
+  `/narrativa`.
+
 ## [1.4.0] — 2026-11-11
 
 ### Corregido
@@ -64,7 +151,7 @@ Versionado semántico.
   limpio y tiene 2,3–2,7 veces menos ruido —y ningún sesgo— cuando hay
   episodios locales, que es cuando el cociente además se sesgaba a corregir de
   menos. Detalle y cifras en
-  [`docs/VALIDACION.md`](docs/VALIDACION.md#9-el-factor-de-correccion-era-un-cociente-de-dos-medias).
+  [`docs/VALIDACION.md`](docs/VALIDACION.md#9-el-factor-de-corrección-era-un-cociente-de-dos-medias).
   El estimador nuevo se guarda en su propio campo (`pm_factor_med_<m>`, con IC
   en `pm_fci_lo/hi_<m>`): cambiarlo dentro de `pm_factor_<m>` habría mezclado
   dos definiciones en una serie, igual que antes se mezclaban dos bases. El

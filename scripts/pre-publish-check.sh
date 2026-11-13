@@ -123,7 +123,7 @@ else
   err "falta LICENSE o no es la GPL-3.0"; FALLOS=$((FALLOS+1))
 fi
 SIN=""
-for f in ai-bridge/*.py scripts/*.sh; do
+for f in ai-bridge/*.py scripts/*.sh tests/*.py; do
   [ -f "$f" ] || continue
   grep -q "SPDX-License-Identifier" "$f" || SIN="$SIN $f"
 done
@@ -134,11 +134,49 @@ else
 fi
 
 paso "5. El proyecto arranca"
-for f in ai-bridge/app.py ai-bridge/euskadi.py ai-bridge/openaq.py ai-bridge/publisher.py; do
+# Todos los .py, no una lista fija: la lista de cuatro dejaba fuera eea.py,
+# acustica.py y narrador.py, y un error de sintaxis en ellos pasaba el audit.
+for f in ai-bridge/*.py tests/*.py; do
+  [ -f "$f" ] || continue
   python3 -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$f" \
     || { err "$f no compila"; FALLOS=$((FALLOS+1)); }
 done
 ok "los módulos Python compilan"
+# Cada import que no es de la biblioteca estándar ni de requirements.txt
+# tiene que ser un fichero de ai-bridge/. Paso dos veces: app.py se subió
+# importando acustica (1.3.0) y eea (1.5.0) sin esos ficheros, y el repo
+# publicado no arrancaba (ModuleNotFoundError) mientras el servidor, con
+# los ficheros copiados a mano, funcionaba.
+FALTAN="$(python3 - <<'PY'
+import ast, glob, os, re, sys
+std = set(sys.stdlib_module_names)
+alias = {"python-dotenv": "dotenv", "pyyaml": "yaml", "beautifulsoup4": "bs4",
+         "scikit-learn": "sklearn", "pillow": "PIL"}
+req = set()
+for l in open("ai-bridge/requirements.txt", encoding="utf-8"):
+    l = l.split("#")[0].strip()
+    if l:
+        n = re.split(r"[<>=!~\[; ]", l, maxsplit=1)[0].strip().lower()
+        req.add(alias.get(n, n.replace("-", "_")))
+faltan = set()
+for f in glob.glob("ai-bridge/*.py"):
+    for n in ast.walk(ast.parse(open(f, encoding="utf-8").read())):
+        mods = ([a.name for a in n.names] if isinstance(n, ast.Import) else
+                [n.module] if isinstance(n, ast.ImportFrom) and n.level == 0
+                and n.module else [])
+        for m in mods:
+            m = m.split(".")[0]
+            if (m not in std and m.lower() not in req
+                    and not os.path.exists("ai-bridge/%s.py" % m)):
+                faltan.add("%s (importado en %s)" % (m, os.path.basename(f)))
+print("; ".join(sorted(faltan)))
+PY
+)"
+if [ -n "$FALTAN" ]; then
+  err "imports sin fichero ni dependencia: $FALTAN"; FALLOS=$((FALLOS+1))
+else
+  ok "cada import local tiene su fichero en ai-bridge/"
+fi
 for f in scripts/*.sh; do bash -n "$f" || { err "$f no compila"; FALLOS=$((FALLOS+1)); }; done
 ok "los scripts compilan"
 if python3 -c "import yaml,sys; yaml.safe_load(open('docker-compose.yml',encoding='utf-8'))" 2>/dev/null; then

@@ -5,6 +5,13 @@ APScheduler==3.10.4
 python-dotenv==1.0.0
 numpy>=1.26,<2.1
 scipy>=1.11,<1.14
-# pyarrow: solo lo usa eea.py para leer los parquet del Download Service de
-# la AEMA. Si falta, eea.py se desactiva solo y la cadena sigue hacia CAMS.
-pyarrow>=16,<27
+# Lector de parquet para eea.py. TOPE <2026.5 A PROPOSITO: desde la 2026.5.0
+# el setup.py de fastparquet fuerza -march=x86-64-v2 (SSE4.1/4.2/POPCNT) sin
+# mirar la CPU, y en el servidor (Core 2 Quad Q6600, 2007) eso mata el
+# proceso con SIGILL, exit 132 -- tambien compilado del fuente. Verificado
+# bajo QEMU con CPU Conroe: la 2026.3.0 arranca y lee parquets de la EEA.
+# NO subir este tope sin repetir esa prueba (docs/VALIDACION.md, caso 10).
+# pyarrow NO se instala: exige SSE4.2 y mata el proceso igual en esa CPU.
+# eea.py lee en un subproceso, asi que aun con un lector malo el servicio
+# no se cae: solo se queda sin referencia EEA.
+fastparquet>=2024.11,<2026.5
